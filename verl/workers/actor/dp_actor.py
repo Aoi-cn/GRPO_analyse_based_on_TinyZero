@@ -94,7 +94,7 @@ class DataParallelPPOActor(BasePPOActor):
                 # input_ids.unsqueeze(-1) 增加一个维度以匹配 unpad_input 的期望输入形状 (B, S, H) -> (total_nnz, H)。
                 # indices 保存了原始有效 token 在展平后的序列中的位置，用于后续恢复原始形状。
                 # cu_seqlens 是累积序列长度，用于 FlashAttention 的变长接口。
-                input_ids_rmpad, indices, cu_seqlens, _ = unpad_input(input_ids.unsqueeze(-1),
+                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
                                                                       attention_mask)  # input_ids_rmpad 形状为 (total_nnz, 1)，total_nnz 是所有样本中非填充 token 的总数
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # 转换为 (1, total_nnz)，以便作为模型输入 (通常模型期望批次维度在前)
 

@@ -355,7 +355,7 @@ class ActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
         data = data.to('cuda')
-
+        breakpoint()
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_param_and_grad(module=self.actor_module_fsdp,
@@ -982,42 +982,98 @@ class RewardModelWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_rm_score(self, data: DataProto):
-        import itertools
-        from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
-        data = data.to('cuda')
-        if self._do_switch_chat_template:
-            rm_data = self._switch_chat_template(data)
+        """
+        计算给定数据批次的奖励模型 (Reward Model, RM) 得分。
 
+        Args:
+            data (DataProto): 包含输入数据的数据对象。
+                              期望包含 'input_ids', 'attention_mask', 'position_ids', 'responses'。
+                              如果配置了 _do_switch_chat_template，还需要 'raw_prompt'。
+
+        Returns:
+            DataProto: 包含计算得到的 token 级别奖励模型得分 ('rm_scores') 的数据对象。
+        """
+        import itertools  # 用于处理可迭代对象，如此处的 indices
+        from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx # 用于动态批次大小处理
+
+        # 将输入数据移动到 CUDA 设备
+        data = data.to('cuda')
+
+        # 如果配置了需要切换聊天模板 (例如，RM 使用的 tokenizer 或模板与 Actor/Rollout 不同)
+        if self._do_switch_chat_template:
+            # 调用 _switch_chat_template 方法对输入数据进行预处理，
+            # 将原始的 prompt 和 response 转换为 RM 期望的格式和 tokenizer。
+            rm_data = self._switch_chat_template(data)
+        else:
+            # 如果不需要切换模板，直接使用原始数据作为 RM 的输入。
+            # 注意：这里应该确保 rm_data 被正确赋值，即使不切换模板。
+            # 通常情况下，如果 _do_switch_chat_template 为 False，rm_data 应该就是 data。
+            # 为了代码的健壮性，显式赋值。
+            rm_data = data
+        # breakpoint() # 调试断点，通常在开发和调试时使用。
+
+        # 将（可能经过模板切换的）RM 输入数据中的批次数据移动到 CUDA 设备。
+        # 确保 rm_data.batch 存在，如果 _switch_chat_template 可能不返回 batch，需要处理。
+        # 假设 _switch_chat_template 返回的 DataProto 对象总是包含 batch 属性。
         rm_data.batch = rm_data.batch.cuda()
 
-        # perform forward computation
+        # 执行前向计算，在 Ulysses Sharding Manager 的上下文中进行，
+        # 这会处理数据在序列并行维度上的分发和收集。
         with self.ulysses_sharding_manager:
+            # 对 RM 输入数据进行预处理（例如，根据序列并行策略进行切分）
             rm_data = self.ulysses_sharding_manager.preprocess_data(data=rm_data)
+            # 对原始输入数据也进行预处理，因为后续 _expand_to_token_level 需要原始数据的 attention_mask 等信息。
+            # 这一步确保了原始 data 和 rm_data 都经过了与 sharding manager 一致的处理。
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
 
+            # 获取是否使用动态批次大小的配置
             use_dynamic_bsz = self.config.use_dynamic_bsz
             if use_dynamic_bsz:
+                # 如果使用动态批次大小，根据每个 GPU 的最大 token 长度和序列并行大小计算总的最大 token 长度。
+                # forward_max_token_len_per_gpu 应该是 RM 的配置项。
                 max_token_len = self.config.forward_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                # 使用 rearrange_micro_batches 将 rm_data.batch 动态地重新排列成微批次，
+                # 以便每个微批次的总 token 数大致均衡，并记录原始样本的索引。
                 micro_batches, indices = rearrange_micro_batches(batch=rm_data.batch, max_token_len=max_token_len)
             else:
+                # 如果不使用动态批次大小，则按固定的 micro_batch_size 将 rm_data.batch 切分成微批次。
                 micro_batches = rm_data.batch.split(self.config.micro_batch_size)
-            output = []
-            for micro_batch in micro_batches:
-                rm_score = self._forward_micro_batch(micro_batch)
-                output.append(rm_score)
-            scores = torch.cat(output, dim=0)  # (batch_size)
 
+            output_scores = [] # 初始化一个列表来存储每个微批次计算得到的 RM 得分
+            # 遍历每个微批次
+            for micro_batch in micro_batches:
+                # 调用 _forward_micro_batch 方法计算当前微批次的 RM 得分。
+                # _forward_micro_batch 内部会处理模型的前向传播，并提取每个序列的单个标量得分。
+                rm_score_micro_batch = self._forward_micro_batch(micro_batch)
+                output_scores.append(rm_score_micro_batch)
+            # 将所有微批次的得分在批次维度上拼接起来，得到整个批次的 RM 得分。
+            scores = torch.cat(output_scores, dim=0)  # 形状为 (batch_size)
+
+            # 如果使用了动态批次大小，需要将打乱顺序的得分恢复到原始顺序。
             if use_dynamic_bsz:
+                # 将 rearrange_micro_batches 返回的嵌套索引列表展平。
                 indices = list(itertools.chain.from_iterable(indices))
+                # 断言检查，确保展平后的索引数量与计算得到的得分数量一致。
                 assert len(indices) == scores.size(0), f"{len(indices)} vs. {scores.size()}"
+                # 获取反向索引，用于将得分恢复到原始顺序。
                 revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+                # 根据反向索引对得分进行重新排序。
                 scores = scores[revert_indices]
 
+            # 调用 _expand_to_token_level 方法将每个序列的标量 RM 得分扩展为 token 级别的得分。
+            # 通常是将标量得分赋给响应序列的最后一个有效 token (或 EOS token) 的位置。
+            # 使用原始的 data 对象，因为它包含了原始的 attention_mask 和 responses 信息。
             token_level_scores = self._expand_to_token_level(data, scores)
-            # Note that this is only the scores, may not be the final rewards used to train RL
+
+            # 注意：这里的 scores 只是 RM 模型直接输出的得分，可能不是最终用于 RL 训练的奖励。
+            # 例如，可能还需要进行归一化、与 KL 惩罚结合等后处理。
+            # 创建一个新的 DataProto 对象来存储计算得到的 token 级别 RM 得分。
             output = DataProto.from_dict(tensors={'rm_scores': token_level_scores})
+            # 对输出数据进行后处理（例如，从序列并行设备收集数据）
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
 
+        # 将最终的输出数据移动到 CPU
         output = output.to('cpu')
+        # 清空 CUDA 缓存以释放未使用的 GPU 内存
         torch.cuda.empty_cache()
         return output

@@ -52,7 +52,7 @@ class RewardManager():
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
 
         already_print_data_sources = {}
-        breakpoint()
+        # breakpoint()
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
 
@@ -226,7 +226,7 @@ def main_task(config):
                             ray_worker_group_cls=ray_worker_group_cls, # 传入 Ray worker 组的类
                             reward_fn=reward_fn, # 传入训练奖励函数
                             val_reward_fn=val_reward_fn) # 传入验证奖励函数
-    breakpoint() # 设置另一个断点，方便调试
+    # breakpoint() # 设置另一个断点，方便调试
     trainer.init_workers() # 初始化所有 worker
     trainer.fit() # 开始训练过程
 
