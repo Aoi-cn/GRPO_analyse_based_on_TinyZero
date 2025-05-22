@@ -57,87 +57,168 @@ class DataParallelPPOActor(BasePPOActor):
 
     def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Returns: 
-            entropy: # (bs, response_len)
-            log_probs: # (bs, response_len)
+        对单个微批次数据执行前向传播，计算熵和对数概率。
+        这个方法主要用于 Actor 模型的推理（计算 log_prob）和 PPO 算法中的策略评估与更新。
+
+        Args:
+            micro_batch (TensorDict): 包含输入数据的微批次。
+                                      期望包含 'input_ids', 'attention_mask', 'position_ids', 'responses'。
+                                      'input_ids' 是 prompt 和 response 的拼接。
+            temperature (float): 用于 logits 缩放的温度参数。较高的温度使概率分布更平滑。
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                entropy (torch.Tensor): 计算得到的策略熵，形状为 (batch_size, response_length)。
+                                        熵衡量了模型输出概率分布的不确定性。
+                log_probs (torch.Tensor): 对应于 micro_batch['responses'] 中 token 的对数概率，
+                                          形状为 (batch_size, response_length)。
         """
+        # breakpoint() # 调试断点，通常在开发和调试时使用。
+
+        # 获取响应序列的长度，用于后续的切片操作，以确保只处理响应部分的 logits 和概率。
         response_length = micro_batch['responses'].size(-1)
+
+        # 使用 torch.autocast 进行混合精度计算（在 CUDA 设备上使用 bfloat16 类型）。
+        # 这可以在保持数值稳定性的同时加速计算并减少内存使用。
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            input_ids = micro_batch['input_ids']
-            batch_size, seqlen = input_ids.shape
-            attention_mask = micro_batch['attention_mask']
-            position_ids = micro_batch['position_ids']
+            # 从微批次中提取输入数据
+            input_ids = micro_batch['input_ids']  # (batch_size, sequence_length)，其中 sequence_length = prompt_length + response_length
+            batch_size, seqlen = input_ids.shape  # 获取当前微批次的批次大小和完整序列长度
+            attention_mask = micro_batch['attention_mask']  # (batch_size, sequence_length)，标记哪些是真实 token，哪些是 padding
+            position_ids = micro_batch['position_ids']  # (batch_size, sequence_length)，为每个 token 提供位置信息
 
+            # 如果配置了使用移除填充 (remove_padding) 的优化。
+            # 这种优化通常与 FlashAttention 结合使用，通过移除序列间的 padding token 来加速注意力计算。
             if self.use_remove_padding:
-                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
-                                                           attention_mask)  # input_ids_rmpad (total_nnz, ...)
-                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+                # 使用 flash_attn.bert_padding.unpad_input 移除输入序列中的填充部分。
+                # input_ids.unsqueeze(-1) 增加一个维度以匹配 unpad_input 的期望输入形状 (B, S, H) -> (total_nnz, H)。
+                # indices 保存了原始有效 token 在展平后的序列中的位置，用于后续恢复原始形状。
+                # cu_seqlens 是累积序列长度，用于 FlashAttention 的变长接口。
+                input_ids_rmpad, indices, cu_seqlens, _ = unpad_input(input_ids.unsqueeze(-1),
+                                                                      attention_mask)  # input_ids_rmpad 形状为 (total_nnz, 1)，total_nnz 是所有样本中非填充 token 的总数
+                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # 转换为 (1, total_nnz)，以便作为模型输入 (通常模型期望批次维度在前)
 
-                # unpad the position_ids to align the rotary
+                # 类似地，移除 position_ids 中的填充，以确保与 input_ids_rmpad 对齐。
+                # 这对于依赖精确位置信息的机制（如旋转位置编码 Rotary Positional Embedding）非常重要。
+                # rearrange 将 (b, s, ...) 转换为 (b*s, ...)，然后 index_first_axis 根据 indices 选择有效部分。
                 position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."),
-                                                      indices).transpose(0, 1)
+                                                      indices).transpose(0, 1)  # 转换为 (1, total_nnz)
 
-                # for compute the log_prob
+                # 为了计算对数概率，我们需要目标 token。
+                # 对于语言模型，在给定前文 input_ids[..., t] 的情况下，目标是预测 input_ids[..., t+1]。
+                # 因此，我们将 input_ids_rmpad 向左滚动一位 (shifts=-1) 来创建目标序列。
                 input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
+                # 注意：最后一个 token 的 "rolled" 对应的是序列之外的，通常在计算损失时会被 mask 掉或不使用。
 
-                # pad and slice the inputs if sp > 1
+                # 如果使用了 Ulysses 序列并行 (ulysses_sequence_parallel_size > 1)。
+                # Ulysses 是一种将长序列在多个设备上进行拆分和并行处理的技术。
                 if self.use_ulysses_sp:
-                    input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(input_ids_rmpad, \
-                                                                                                position_ids_rmpad, \
-                                                                                                sp_size=self.ulysses_sequence_parallel_size)
-                    input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(input_ids_rmpad_rolled, None,
-                                                                                self.ulysses_sequence_parallel_size)
+                    # 对移除填充后的 input_ids 和 position_ids 进行 Ulysses 序列并行的填充和切片。
+                    # pad_size 是为了确保序列长度能被序列并行大小整除而添加的填充大小。
+                    input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
+                        input_ids_rmpad,
+                        position_ids_rmpad,
+                        sp_size=self.ulysses_sequence_parallel_size
+                    )
+                    # 同样处理 rolled 的 input_ids，确保对齐。
+                    input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
+                        input_ids_rmpad_rolled, None, # position_ids_rmpad_rolled 不是必需的
+                        self.ulysses_sequence_parallel_size
+                    )
 
-                input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
+                # 移除 input_ids_rmpad_rolled 的第一个维度（如果存在），使其形状为 ( (total_nnz_after_sp_slice) )。
+                # total_nnz_after_sp_slice = (total_nnz / sp_size) + pad_size_for_sp
+                input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)
 
-                # only pass input_ids and position_ids to enable flash_attn_varlen
+                # 将处理后的 input_ids_rmpad 和 position_ids_rmpad 传递给 actor_module (模型)。
+                # 当使用 FlashAttention 的变长接口 (flash_attn_varlen) 时，通常不需要显式的 attention_mask，
+                # 因为 token 间的填充已被移除，cu_seqlens (或类似的机制) 会告知注意力模块每个序列的边界。
+                # use_cache=False 防止模型认为我们正在进行自回归生成（这会启用 KV 缓存，在训练或计算完整序列 log_prob 时通常不需要）。
                 output = self.actor_module(input_ids=input_ids_rmpad,
-                                           attention_mask=None,
+                                           attention_mask=None, # 假设模型内部能处理无 mask 的情况或使用 cu_seqlens
                                            position_ids=position_ids_rmpad,
-                                           use_cache=False)  # prevent model thinks we are generating
-                logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                                           use_cache=False)
+                # 获取模型的输出 logits。对于移除填充的输入，输出 logits 的批次维度通常也是1或被压缩。
+                logits_rmpad = output.logits.squeeze(0)  # 形状为 (total_nnz_after_sp_slice, vocab_size)
 
+                # 将 logits 除以温度参数。温度参数可以调整输出概率分布的平滑度。
+                # temperature > 1 使分布更平滑（更随机），temperature < 1 使分布更尖锐（更确定）。
+                # 在计算 log_prob 时，这个温度应该与生成时使用的温度一致（如果目标是重现生成时的 log_prob）。
                 logits_rmpad.div_(temperature)
 
-                # compute entropy
-                entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+                # 从处理后的 logits 计算熵。
+                # self.compute_entropy_from_logits 是 torch.compile 编译过的 verl_F.entropy_from_logits。
+                entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # 形状为 (total_nnz_after_sp_slice)
 
-                # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
+                # 从处理后的 logits 和对应的目标 token (input_ids_rmpad_rolled) 计算对数概率。
+                # logprobs_from_logits 通常会执行 log_softmax 然后根据 labels 收集对应的值。
+                log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled) # 形状为 (total_nnz_after_sp_slice)
 
-                # gather log_prob if sp > 1
+                # 如果使用了 Ulysses 序列并行
                 if self.use_ulysses_sp:
-                    # gather and unpad for the ulysses sp
+                    # 从不同设备收集输出（log_probs 和 entropy_rmpad），并移除 Ulysses 引入的填充。
+                    # gather_dim 和 unpad_dim 指定了在哪个维度上进行收集和移除填充。
                     log_probs = gather_outpus_and_unpad(log_probs, gather_dim=0, unpad_dim=0, padding_size=pad_size)
                     entropy_rmpad = gather_outpus_and_unpad(entropy_rmpad,
                                                             gather_dim=0,
                                                             unpad_dim=0,
                                                             padding_size=pad_size)
-                # pad back to (bsz, seqlen)
+                    # 此时 log_probs 和 entropy_rmpad 的形状恢复到 (total_nnz)
+
+                # 将移除填充并可能经过序列并行处理的熵和对数概率，使用原始的 indices 填充回原始的批次和序列长度形状。
+                # unsqueeze(-1) 是为了匹配 pad_input 的期望输入形状 (total_nnz, H)。
                 full_entropy = pad_input(hidden_states=entropy_rmpad.unsqueeze(-1),
                                          indices=indices,
-                                         batch=batch_size,
-                                         seqlen=seqlen)
+                                         batch=batch_size, # 原始微批次的 batch_size
+                                         seqlen=seqlen) # 原始微批次的 seqlen
+                                         # full_entropy 形状为 (batch_size, seqlen, 1)
                 full_log_probs = pad_input(hidden_states=log_probs.unsqueeze(-1),
                                            indices=indices,
                                            batch=batch_size,
                                            seqlen=seqlen)
+                                           # full_log_probs 形状为 (batch_size, seqlen, 1)
 
-                # only return response part:
-                entropy = full_entropy.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
-                log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
+                # 只返回响应部分的熵和对数概率。
+                # `[:, -response_length - 1:-1]` 这个切片逻辑是为了提取对应于 `responses` 部分的 token 的预测结果。
+                # 假设 `input_ids` 是 `prompt + response`。
+                # `log_probs` 的第 `t` 个位置的值是 `log P(input_ids[t+1] | input_ids[0...t])`。
+                # 我们需要的是对应于 `responses` 部分的 `log_probs`。
+                # `responses` 对应于 `input_ids` 的最后 `response_length` 个 token。
+                # 因此，我们需要 `log_probs` 中对应于 `input_ids` 中 `prompt_len-1` 到 `seq_len-2` 这些位置的预测。
+                # `seq_len - 1 - response_length` 是 prompt 的最后一个 token 的索引。
+                # `seq_len - 2` 是 response 的倒数第二个 token 的索引。
+                # 切片 `[:, -response_length - 1:-1]` 提取的是从倒数第 `response_length + 1` 个 token 的预测
+                # (即预测 response 的第一个 token) 到倒数第 2 个 token 的预测 (即预测 response 的最后一个 token)。
+                # 结果的长度是 `(-1) - (-response_length - 1) = response_length`。
+                entropy = full_entropy.squeeze(-1)[:, -response_length - 1:-1]  # (batch_size, response_length)
+                log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1:-1]  # (batch_size, response_length)
 
-            else:  # not using rmpad and no ulysses sp
+            else:  # 如果不使用移除填充 (use_remove_padding is False)，并且没有 Ulysses 序列并行
+                # 直接将包含填充的原始 input_ids, attention_mask, position_ids 传递给模型。
                 output = self.actor_module(input_ids=input_ids,
                                            attention_mask=attention_mask,
                                            position_ids=position_ids,
-                                           use_cache=False)  # prevent model thinks we are generating
-                logits = output.logits
-                logits.div_(temperature)
-                logits = logits[:, -response_length - 1:-1]  # (bsz, response_length)
-                log_probs = logprobs_from_logits(logits, micro_batch['responses'])
-                entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                                           use_cache=False) # 同样，禁用 KV 缓存以获取整个序列的 logits
+                logits = output.logits # 获取原始 logits，形状为 (batch_size, seqlen, vocab_size)
 
+                # 对 logits 进行温度缩放
+                logits.div_(temperature)
+
+                # 从完整序列的 logits 中提取对应于响应部分前一个 token 的 logits。
+                # `logits[:, -response_length - 1:-1]` 这个切片提取了从序列倒数 `response_length + 1` 个位置开始的 logits
+                # (这些 logits 用于预测 response 的第一个 token)，到倒数第 2 个位置的 logits (用于预测 response 的最后一个 token)。
+                # 提取出的 logits 的序列长度维度是 `response_length`。
+                # 形状变为 (batch_size, response_length, vocab_size)
+                logits_for_responses = logits[:, -response_length - 1:-1]
+
+                # 根据提取出的 logits 和实际的响应 token (micro_batch['responses']) 计算对数概率。
+                # micro_batch['responses'] 的形状是 (batch_size, response_length)
+                log_probs = logprobs_from_logits(logits_for_responses, micro_batch['responses']) # (batch_size, response_length)
+
+                # 根据提取出的 logits (对应响应部分的) 计算熵。
+                entropy = verl_F.entropy_from_logits(logits_for_responses)  # (batch_size, response_length)
+
+            # 返回计算得到的熵和对数概率 (只包含响应部分)
             return entropy, log_probs
 
     def _optimizer_step(self):
@@ -169,6 +250,7 @@ class DataParallelPPOActor(BasePPOActor):
             torch.Tensor: the log_prob tensor
         """
         # set to eval
+        # breakpoint()
         self.actor_module.eval()
 
         micro_batch_size = data.meta_info['micro_batch_size']

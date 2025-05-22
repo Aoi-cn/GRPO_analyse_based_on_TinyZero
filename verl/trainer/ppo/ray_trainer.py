@@ -392,6 +392,7 @@ class RayPPOTrainer(object):
     def _validate(self):
         reward_tensor_lst = []
         data_source_lst = []
+        # breakpoint()
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
             # test_batch = test_batch.to('cuda')
@@ -442,76 +443,128 @@ class RayPPOTrainer(object):
         return metric_dict
 
     def init_workers(self):
-        """Init resource pool and worker group"""
+        """初始化资源池和工作组 (Worker Group)"""
+        # 1. 创建实际的 Ray 资源池
+        # self.resource_pool_manager 包含了资源池的规格和角色到池的映射
+        # create_resource_pool() 方法会根据规格实际创建这些 RayResourcePool 对象
         self.resource_pool_manager.create_resource_pool()
 
+        # 2. 初始化一个字典，用于存储每个资源池 (RayResourcePool 对象) 将要运行的 Worker 类及其配置
+        # 键是 RayResourcePool 对象，值是一个字典 (角色名 -> RayClassWithInitArgs)
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
-        # create actor and rollout
+        # 3. 配置 Actor 和 Rollout Worker
+        # self.hybrid_engine 通常表示 Actor 和 Rollout 功能合并在一个 Worker 中
         if self.hybrid_engine:
+            # 获取 ActorRollout 角色应该使用的资源池
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+            # 创建 RayClassWithInitArgs 对象，封装了 Worker 类、配置和角色名
+            # cls: 从 role_worker_mapping 中获取 ActorRollout 对应的 Worker 类
+            # config: ActorRollout 相关的配置 (self.config.actor_rollout_ref)
+            # role: 指定角色名为 'actor_rollout'，用于后续 WorkerGroup 的命名和管理
             actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.ActorRollout],
                                                      config=self.config.actor_rollout_ref,
                                                      role='actor_rollout')
+            # 将 actor_rollout_cls 添加到其对应的资源池的映射中
             self.resource_pool_to_cls[resource_pool]['actor_rollout'] = actor_rollout_cls
         else:
+            # 如果不是混合引擎模式，当前实现不支持，抛出错误
             raise NotImplementedError
 
-        # create critic
-        if self.config.algorithm.adv_estimator == 'gae':
+        # 4. 配置 Critic Worker (如果使用 GAE 优势估计)
+        if self.config.algorithm.adv_estimator == 'gae': # Generalized Advantage Estimation
+            # 获取 Critic 角色应该使用的资源池
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
+            # 创建 Critic Worker 的 RayClassWithInitArgs 对象
+            # cls: 从 role_worker_mapping 中获取 Critic 对应的 Worker 类
+            # config: Critic 相关的配置 (self.config.critic)
+            # 角色名默认为 'critic' (由 RayClassWithInitArgs 内部逻辑或后续 spawn 决定)
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)
+            # 将 critic_cls 添加到其对应的资源池的映射中
             self.resource_pool_to_cls[resource_pool]['critic'] = critic_cls
+            # 设置标志位，表示将使用 Critic
             self.use_critic = True
-        elif self.config.algorithm.adv_estimator == 'grpo':
+        elif self.config.algorithm.adv_estimator == 'grpo': # Group-wise Reward Policy Optimization
+            # GRPO 可能不直接使用独立的 Critic 网络进行价值估计
             self.use_critic = False
         else:
+            # 如果优势估计算法不是 'gae' 或 'grpo'，抛出错误
             raise NotImplementedError
 
-        # create reference policy if needed
+        # 5. 配置 Reference Policy Worker (如果需要)
+        # self.use_reference_policy 标志在 __init__ 中根据 role_worker_mapping 是否包含 RefPolicy 设置
         if self.use_reference_policy:
+            # 获取 RefPolicy 角色应该使用的资源池
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+            # 创建 Reference Policy Worker 的 RayClassWithInitArgs 对象
+            # cls: 从 role_worker_mapping 中获取 RefPolicy 对应的 Worker 类
+            # config: 参考策略通常使用与 ActorRollout 相同的模型结构和配置 (self.config.actor_rollout_ref)
+            # role: 指定角色名为 'ref'
             ref_policy_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RefPolicy],
                                                   config=self.config.actor_rollout_ref,
                                                   role='ref')
+            # 将 ref_policy_cls 添加到其对应的资源池的映射中
             self.resource_pool_to_cls[resource_pool]['ref'] = ref_policy_cls
 
-        # create a reward model if reward_fn is None
+        # 6. 配置 Reward Model (RM) Worker (如果需要)
+        # self.use_rm 标志在 __init__ 中根据 role_worker_mapping 是否包含 RewardModel 设置
         if self.use_rm:
-            # we create a RM here
+            # 如果使用基于模型的奖励，则创建 RM Worker
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+            # 创建 Reward Model Worker 的 RayClassWithInitArgs 对象
+            # cls: 从 role_worker_mapping 中获取 RewardModel 对应的 Worker 类
+            # config: Reward Model 相关的配置 (self.config.reward_model)
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
+            # 将 rm_cls 添加到其对应的资源池的映射中
             self.resource_pool_to_cls[resource_pool]['rm'] = rm_cls
 
-        # initialize WorkerGroup
-        # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
-        # you should not use `create_colocated_worker_cls`. Instead, directly pass different resource pool to different worker groups.
-        # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
-        all_wg = {}
-        self.wg_dicts = []
+        # 7. 初始化 WorkerGroup
+        # NOTE: 如果希望每个角色使用不同的资源池（可以支持不同的并行大小），
+        # 则不应使用 `create_colocated_worker_cls`。而是直接将不同的资源池传递给不同的工作组。
+        # 更多信息请参见 https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb。
+
+        all_wg = {} # 用于存储所有创建的 Worker Group 实例，键为角色名
+        self.wg_dicts = [] # 用于存储 WorkerDict 的引用，以支持 ray >= 2.31
+        # 遍历之前构建的 self.resource_pool_to_cls 字典
+        # resource_pool 是 RayResourcePool 对象
+        # class_dict 是一个字典，例如 {'actor_rollout': actor_rollout_cls_obj, 'critic': critic_cls_obj}
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
+            # 如果一个资源池中有多个角色（例如，Actor 和 Critic 在同一个资源池），
+            # create_colocated_worker_cls 会将它们组合成一个单一的 Ray Actor 类 (WorkerDict)，
+            # 这个 Actor 类内部会管理这些不同的 Worker 实例。
+            # class_dict: {'role_name_A': RayClassWithInitArgs_A, 'role_name_B': RayClassWithInitArgs_B}
             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+
+            # 使用指定的 RayWorkerGroup 类 (例如 RayWorkerGroup 或 NVMegatronRayWorkerGroup)
+            # 为当前资源池和组合后的 worker_dict_cls 创建一个 WorkerGroup 管理对象 (wg_dict)
             wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls)
+
+            # 调用 wg_dict.spawn() 来实际创建 Ray Actor 实例 (Worker)
+            # prefix_set=class_dict.keys() 告诉 spawn 方法要为 class_dict 中的哪些角色创建 Worker 实例
+            # spawn_wg 返回一个字典，键是角色名，值是对应的 WorkerGroup 代理对象 (Ray Actor Handle)
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+            # 将新创建的 Worker Group 代理对象合并到 all_wg 字典中
             all_wg.update(spawn_wg)
-            # keep the referece of WorkerDict to support ray >= 2.31. Ref: https://github.com/ray-project/ray/pull/45699
+            # 保留 WorkerDict 的引用，以支持 ray >= 2.31 (参考 Ray PR #45699)
             self.wg_dicts.append(wg_dict)
 
+        # 8. 将创建的 Worker Group 代理对象赋值给相应的实例变量，并初始化模型
         if self.use_critic:
-            self.critic_wg = all_wg['critic']
-            self.critic_wg.init_model()
+            self.critic_wg = all_wg['critic'] # 获取 Critic Worker Group
+            self.critic_wg.init_model()       # 调用其 init_model 方法进行初始化
 
         if self.use_reference_policy:
-            self.ref_policy_wg = all_wg['ref']
-            self.ref_policy_wg.init_model()
+            self.ref_policy_wg = all_wg['ref'] # 获取 Reference Policy Worker Group
+            self.ref_policy_wg.init_model()    # 初始化模型
 
         if self.use_rm:
-            self.rm_wg = all_wg['rm']
-            self.rm_wg.init_model()
+            self.rm_wg = all_wg['rm']          # 获取 Reward Model Worker Group
+            self.rm_wg.init_model()            # 初始化模型
 
-        # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.actor_rollout_wg = all_wg['actor_rollout']
-        self.actor_rollout_wg.init_model()
+        # ActorRollout Worker Group 最后创建和初始化
+        # 这对于使用 vLLM 等推理引擎的场景可能比较重要，因为它可以在其他模型加载后更好地估计 KV 缓存内存
+        self.actor_rollout_wg = all_wg['actor_rollout'] # 获取 ActorRollout Worker Group
+        self.actor_rollout_wg.init_model()              # 初始化模型
 
     def _save_checkpoint(self):
         actor_local_path = os.path.join(self.config.trainer.default_local_dir, 'actor',
@@ -546,144 +599,207 @@ class RayPPOTrainer(object):
 
     def fit(self):
         """
-        The training loop of PPO.
-        The driver process only need to call the compute functions of the worker group through RPC to construct the PPO dataflow.
-        The light-weight advantage computation is done on the driver process.
+        PPO 的训练循环。
+        驱动程序进程只需要通过 RPC 调用工作组的计算函数来构建 PPO 数据流。
+        轻量级的优势计算在驱动程序进程上完成。
         """
+        # 从 verl.utils.tracking 模块导入 Tracking 类，用于实验跟踪和日志记录
         from verl.utils.tracking import Tracking
+        # 从 omegaconf 模块导入 OmegaConf，用于处理配置文件
         from omegaconf import OmegaConf
 
+        # 初始化 Tracking 对象，用于记录实验的指标和配置
+        # project_name: 项目名称，从配置中获取
+        # experiment_name: 实验名称，从配置中获取
+        # default_backend: 日志记录的后端，从配置中获取 (例如，wandb, tensorboard)
+        # config: 将 OmegaConf 配置对象转换为字典，并解析所有变量
         logger = Tracking(project_name=self.config.trainer.project_name,
                           experiment_name=self.config.trainer.experiment_name,
                           default_backend=self.config.trainer.logger,
                           config=OmegaConf.to_container(self.config, resolve=True))
 
+        # 初始化全局训练步数
         self.global_steps = 0
 
-        # perform validation before training
-        # currently, we only support validation using the reward_function.
+        # 在训练开始前执行验证
+        # 目前，我们只支持使用 reward_function 进行验证。
+        # 如果配置了验证奖励函数 (self.val_reward_fn) 并且配置允许在训练前验证
         if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
+            # 调用 _validate 方法执行验证
             val_metrics = self._validate()
+            # 打印初始验证指标
             pprint(f'Initial validation metrics: {val_metrics}')
+            # 使用 logger 记录验证指标
             logger.log(data=val_metrics, step=self.global_steps)
+            # 如果配置了 'val_only' 为 True，则只进行验证，不进行训练，直接返回
             if self.config.trainer.get('val_only', False):
                 return
 
-        # we start from step 1
+        # 训练从第 1 步开始
         self.global_steps += 1
 
+        # 外层循环：遍历总的训练轮数 (epochs)
         for epoch in range(self.config.trainer.total_epochs):
+            # 内层循环：遍历训练数据加载器中的每个批次 (batch)
             for batch_dict in self.train_dataloader:
+                # 打印当前的 epoch 和全局步数
                 print(f'epoch {epoch}, step {self.global_steps}')
+                # 初始化用于存储当前批次指标的字典
                 metrics = {}
+                # 初始化用于存储当前批次各阶段耗时的字典
                 timing_raw = {}
 
+                # 将从 dataloader 获取的字典转换为 DataProto 对象，这是一种自定义的数据结构
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
-                # pop those keys for generation
+                # 从批次数据中弹出用于序列生成的键 ('input_ids', 'attention_mask', 'position_ids')
+                # 这些键对应的数据将用于 actor 模型生成响应序列
                 gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
 
+                # 使用 _timer 上下文管理器记录整个训练步骤 (step) 的耗时
                 with _timer('step', timing_raw):
-                    # generate a batch
+                    # 1. 生成序列 (Rollout 阶段)
+                    # 使用 _timer 记录序列生成 (gen) 的耗时
                     with _timer('gen', timing_raw):
+                        # 调用 actor_rollout_wg (Actor-Rollout Worker Group) 的 generate_sequences 方法生成响应序列
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
+                    # 为批次中的每个样本生成一个唯一的 ID (uid)
                     batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                                                              dtype=object)
-                    # repeat to align with repeated responses in rollout
+                    # 根据配置中的 rollout.n (每个 prompt 生成的响应数量) 重复批次数据，以与 rollout 过程中生成的多个响应对齐
+                    # interleave=True 表示交错重复
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    # 将生成的序列数据 (gen_batch_output) 合并回原始批次数据 (batch)
                     batch = batch.union(gen_batch_output)
 
-                    # balance the number of valid tokens on each dp rank.
-                    # Note that this breaks the order of data inside the batch.
-                    # Please take care when you implement group based adv computation such as GRPO and rloo
+                    # 2. 平衡每个数据并行 (DP) rank 上的有效 token 数量
+                    # 注意：这会打乱批次内数据的顺序。
+                    # 如果实现基于组的优势计算（如 GRPO 和 RLOO），需要特别注意。
                     self._balance_batch(batch, metrics=metrics)
 
-                    # compute global_valid tokens
+                    # 计算全局有效 token 数量，并存储在批次的 meta_info 中
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
 
+                    # 3. 如果使用参考策略 (Reference Policy)
                     if self.use_reference_policy:
-                        # compute reference log_prob
+                        # 计算参考策略的 log_prob
                         with _timer('ref', timing_raw):
+                            # 调用 ref_policy_wg (Reference Policy Worker Group) 计算参考 log_prob
                             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            # 将计算得到的 ref_log_prob 合并到批次数据中
                             batch = batch.union(ref_log_prob)
 
-                    # compute values
+                    # 4. 如果使用 Critic 网络
                     if self.use_critic:
+                        # 计算价值 (values)
                         with _timer('values', timing_raw):
+                            # 调用 critic_wg (Critic Worker Group) 计算状态价值
                             values = self.critic_wg.compute_values(batch)
+                            # 将计算得到的 values 合并到批次数据中
                             batch = batch.union(values)
 
+                    # 5. 计算优势 (Advantage) 和奖励 (Reward)
                     with _timer('adv', timing_raw):
-                        # compute scores. Support both model and function-based.
-                        # We first compute the scores using reward model. Then, we call reward_fn to combine
-                        # the results from reward model and rule-based results.
-                        if self.use_rm:
-                            # we first compute reward model score
+                        # 计算得分 (scores)。支持基于模型和基于函数的奖励。
+                        # 首先使用奖励模型 (Reward Model, RM) 计算得分，然后调用 reward_fn 结合奖励模型的结果和基于规则的结果。
+                        if self.use_rm: # 如果使用奖励模型
+                            # 首先计算奖励模型的得分
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            # 将奖励模型的得分合并到批次数据中
                             batch = batch.union(reward_tensor)
 
-                        # we combine with rule-based rm
+                        # 结合基于规则的奖励模型 (rule-based RM)
+                        # 调用 self.reward_fn (通常是一个 RewardManager 实例) 计算最终的 token 级别得分
                         reward_tensor = self.reward_fn(batch)
+                        # 将最终的 token 级别得分存储在批次数据中
                         batch.batch['token_level_scores'] = reward_tensor
 
-                        # compute rewards. apply_kl_penalty if available
+                        # 计算奖励 (rewards)。如果可用，则应用 KL 惩罚。
+                        # 如果配置中 actor 不使用 KL 损失 (use_kl_loss 为 False)
                         if not self.config.actor_rollout_ref.actor.use_kl_loss:
+                            # 应用 KL 惩罚，调整 token_level_scores 得到 token_level_rewards
+                            # kl_ctrl: KL 控制器 (AdaptiveKLController 或 FixedKLController)
+                            # kl_penalty: KL 惩罚的类型
                             batch, kl_metrics = apply_kl_penalty(batch,
                                                                  kl_ctrl=self.kl_ctrl,
                                                                  kl_penalty=self.config.algorithm.kl_penalty)
+                            # 更新指标字典
                             metrics.update(kl_metrics)
                         else:
+                            # 如果 actor 使用 KL 损失，则 token_level_rewards 直接等于 token_level_scores
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
-                        # compute advantages, executed on the driver process
+                        # 计算优势 (advantages)，在驱动程序进程上执行
+                        # adv_estimator: 优势估计算法 (例如 'gae', 'grpo')
+                        # gamma: 折扣因子
+                        # lam: GAE 的 lambda 参数
+                        # num_repeat: rollout 的重复次数
                         batch = compute_advantage(batch,
                                                   adv_estimator=self.config.algorithm.adv_estimator,
                                                   gamma=self.config.algorithm.gamma,
                                                   lam=self.config.algorithm.lam,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
 
-                    # update critic
+                    # 6. 更新 Critic 网络
                     if self.use_critic:
                         with _timer('update_critic', timing_raw):
+                            # 调用 critic_wg 更新 Critic 网络
                             critic_output = self.critic_wg.update_critic(batch)
+                        # 从 Critic 更新的输出中提取指标，并进行归约 (例如，计算均值)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
+                        # 更新指标字典
                         metrics.update(critic_output_metrics)
 
-                    # implement critic warmup
+                    # 7. 实现 Critic 预热 (warmup)
+                    # 如果当前全局步数大于等于 Critic 预热步数
                     if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
+                        # 更新 Actor 网络
                         with _timer('update_actor', timing_raw):
+                            # 调用 actor_rollout_wg 更新 Actor 网络
                             actor_output = self.actor_rollout_wg.update_actor(batch)
+                        # 从 Actor 更新的输出中提取指标，并进行归约
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                        # 更新指标字典
                         metrics.update(actor_output_metrics)
 
-                    # validate
+                    # 8. 执行验证 (Validation)
+                    # 如果配置了验证奖励函数，并且验证频率大于 0，并且当前全局步数是验证频率的倍数
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
                         self.global_steps % self.config.trainer.test_freq == 0:
                         with _timer('testing', timing_raw):
+                            # 调用 _validate 方法执行验证
                             val_metrics: dict = self._validate()
+                        # 更新指标字典
                         metrics.update(val_metrics)
 
+                    # 9. 保存检查点 (Checkpoint)
+                    # 如果保存频率大于 0，并且当前全局步数是保存频率的倍数
                     if self.config.trainer.save_freq > 0 and \
                             self.global_steps % self.config.trainer.save_freq == 0:
                         with _timer('save_checkpoint', timing_raw):
+                            # 调用 _save_checkpoint 方法保存模型检查点
                             self._save_checkpoint()
 
-                # collect metrics
+                # 10. 收集和记录指标
+                # 计算与数据相关的指标 (例如，奖励、优势、价值的均值/最大值/最小值等)
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                # 计算与时间相关的指标 (例如，各阶段耗时，每 token 耗时)
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
 
-                # TODO: make a canonical logger that supports various backend
+                # TODO: 创建一个支持多种后端的规范化 logger
+                # 使用 logger 记录当前步骤的所有指标
                 logger.log(data=metrics, step=self.global_steps)
 
+                # 全局步数加 1
                 self.global_steps += 1
 
+                # 如果当前全局步数达到总训练步数
                 if self.global_steps >= self.total_training_steps:
-
-                    # perform validation after training
+                    # 在训练结束后执行最终验证
                     if self.val_reward_fn is not None:
                         val_metrics = self._validate()
                         pprint(f'Final validation metrics: {val_metrics}')
                         logger.log(data=val_metrics, step=self.global_steps)
+                    # 结束训练
                     return

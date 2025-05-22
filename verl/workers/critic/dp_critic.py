@@ -51,6 +51,7 @@ class DataParallelPPOCritic(BasePPOCritic):
         self.ulysses_sequence_parallel_size = self.config.get('ulysses_sequence_parallel_size', 1)
 
     def _forward_micro_batch(self, micro_batch):
+        breakpoint()
         response_length = micro_batch['responses'].size(-1)
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             input_ids = micro_batch['input_ids']
@@ -111,6 +112,7 @@ class DataParallelPPOCritic(BasePPOCritic):
         return grad_norm
 
     def compute_values(self, data: DataProto) -> torch.Tensor:
+        breakpoint()
         self.critic_module.eval()
         micro_batch_size = data.meta_info['micro_batch_size']
         select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids']
@@ -144,6 +146,7 @@ class DataParallelPPOCritic(BasePPOCritic):
         return values
 
     def update_critic(self, data: DataProto):
+        breakpoint()
         # make sure we are in training mode
         self.critic_module.train()
         metrics = {}

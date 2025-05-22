@@ -52,7 +52,7 @@ class RewardManager():
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
 
         already_print_data_sources = {}
-
+        breakpoint()
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
 
@@ -105,88 +105,130 @@ def main(config):
 
 @ray.remote
 def main_task(config):
+    # 从 verl.utils.fs 模块导入 copy_local_path_from_hdfs 函数，用于从 HDFS 复制文件到本地
     from verl.utils.fs import copy_local_path_from_hdfs
+    # 从 transformers 库导入 AutoTokenizer，用于自动加载预训练模型的分词器
     from transformers import AutoTokenizer
 
-    # print initial config
-    from pprint import pprint
-    from omegaconf import OmegaConf
-    pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
-    OmegaConf.resolve(config)
+    # 打印初始配置信息
+    from pprint import pprint # 导入 pprint 模块，用于更美观地打印 Python 对象
+    from omegaconf import OmegaConf # 导入 OmegaConf 库，用于处理配置文件
+    pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True 会解析配置中的符号值（例如，${xxx}）
+    OmegaConf.resolve(config) # 再次确保所有配置值都已解析
+    breakpoint() # 设置一个断点，方便调试时检查程序状态
 
-    # download the checkpoint from hdfs
+    # 从 HDFS 下载检查点文件
+    # config.actor_rollout_ref.model.path 指定了模型在 HDFS 上的路径
     local_path = copy_local_path_from_hdfs(config.actor_rollout_ref.model.path)
 
-    # instantiate tokenizer
-    from verl.utils import hf_tokenizer
+    # 实例化分词器
+    from verl.utils import hf_tokenizer # 从 verl.utils 模块导入 hf_tokenizer 函数
+    # 使用下载到本地的模型路径来初始化分词器
     tokenizer = hf_tokenizer(local_path)
 
-    # define worker classes
+    # 定义 worker 类
+    # 根据配置中 actor_rollout_ref.actor.strategy 的值来选择不同的 worker 实现
     if config.actor_rollout_ref.actor.strategy == 'fsdp':
+        # 如果策略是 'fsdp' (Fully Sharded Data Parallel)
+        # 断言 actor 和 critic 的策略必须相同
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
+        # 从 verl.workers.fsdp_workers 模块导入 FSDP 版本的 ActorRolloutRefWorker 和 CriticWorker
         from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
+        # 从 verl.single_controller.ray 模块导入 RayWorkerGroup，用于管理 Ray worker
         from verl.single_controller.ray import RayWorkerGroup
-        ray_worker_group_cls = RayWorkerGroup
+        ray_worker_group_cls = RayWorkerGroup # 将 RayWorkerGroup 赋值给 ray_worker_group_cls
 
     elif config.actor_rollout_ref.actor.strategy == 'megatron':
+        # 如果策略是 'megatron' (一种大规模模型训练框架)
+        # 断言 actor 和 critic 的策略必须相同
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
+        # 从 verl.workers.megatron_workers 模块导入 Megatron 版本的 ActorRolloutRefWorker 和 CriticWorker
         from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
+        # 从 verl.single_controller.ray.megatron 模块导入 NVMegatronRayWorkerGroup
         from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
-        ray_worker_group_cls = NVMegatronRayWorkerGroup
+        ray_worker_group_cls = NVMegatronRayWorkerGroup # 将 NVMegatronRayWorkerGroup 赋值给 ray_worker_group_cls
 
     else:
+        # 如果策略不是 'fsdp' 或 'megatron'，则抛出 NotImplementedError
         raise NotImplementedError
 
+    # 从 verl.trainer.ppo.ray_trainer 模块导入 ResourcePoolManager 和 Role
+    # ResourcePoolManager 用于管理资源池，Role 用于定义不同 worker 的角色
     from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
+    # 定义角色到 worker 类的映射
+    # Role.ActorRollout: 对应 ActorRolloutRefWorker，用于生成经验数据
+    # Role.Critic: 对应 CriticWorker，用于评估状态价值
+    # Role.RefPolicy: 对应 ActorRolloutRefWorker，作为参考策略（通常是初始模型或SFT模型）
     role_worker_mapping = {
-        Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
-        Role.Critic: ray.remote(CriticWorker),
-        Role.RefPolicy: ray.remote(ActorRolloutRefWorker)
+        Role.ActorRollout: ray.remote(ActorRolloutRefWorker), # 将 ActorRolloutRefWorker 声明为 Ray远程 actor
+        Role.Critic: ray.remote(CriticWorker), # 将 CriticWorker 声明为 Ray远程 actor
+        Role.RefPolicy: ray.remote(ActorRolloutRefWorker) # 将 ActorRolloutRefWorker 声明为 Ray远程 actor
     }
 
-    global_pool_id = 'global_pool'
+    global_pool_id = 'global_pool' # 定义全局资源池的 ID
+    # 定义资源池的规格
+    # global_pool_id 对应一个列表，列表中的每个元素代表一个节点的 GPU 数量
+    # config.trainer.n_gpus_per_node 是每个节点的 GPU 数量
+    # config.trainer.nnodes 是节点的数量
     resource_pool_spec = {
         global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
     }
+    # 定义角色到资源池的映射
+    # 所有角色都使用 'global_pool' 资源池
     mapping = {
         Role.ActorRollout: global_pool_id,
         Role.Critic: global_pool_id,
         Role.RefPolicy: global_pool_id,
     }
 
-    # we should adopt a multi-source reward function here
-    # - for rule-based rm, we directly call a reward score
-    # - for model-based rm, we call a model
-    # - for code related prompt, we send to a sandbox if there are test cases
-    # - finally, we combine all the rewards together
-    # - The reward type depends on the tag of the data
+    # 这里将采用多源奖励函数：
+    # - 对于基于规则的奖励模型 (RM)，直接调用奖励分数函数
+    # - 对于基于模型的 RM，调用一个模型进行评估
+    # - 对于代码相关的提示，如果存在测试用例，则发送到沙箱执行
+    # - 最后，将所有奖励组合起来
+    # - 奖励类型取决于数据的标签
+
+    # 如果启用了奖励模型 (config.reward_model.enable 为 True)
     if config.reward_model.enable:
+        # 根据奖励模型的策略选择不同的 RewardModelWorker 实现
         if config.reward_model.strategy == 'fsdp':
             from verl.workers.fsdp_workers import RewardModelWorker
         elif config.reward_model.strategy == 'megatron':
             from verl.workers.megatron_workers import RewardModelWorker
         else:
             raise NotImplementedError
+        # 将 RewardModelWorker 添加到角色 worker 映射中
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
+        # 将 RewardModel 角色也映射到全局资源池
         mapping[Role.RewardModel] = global_pool_id
 
+    # 实例化奖励管理器，用于训练过程中的奖励计算
+    # tokenizer: 之前实例化的分词器
+    # num_examine: 打印到控制台的已解码响应的批次数，这里设置为 0，表示不打印
     reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0)
 
-    # Note that we always use function-based RM for validation
+    # 注意：验证过程始终使用基于函数的奖励模型 (RM)
+    # 实例化用于验证的奖励管理器
+    # num_examine: 设置为 1，表示在验证时会打印一个批次的解码响应
     val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1)
 
+    # 实例化资源池管理器
+    # resource_pool_spec: 定义的资源池规格
+    # mapping: 定义的角色到资源池的映射
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-    trainer = RayPPOTrainer(config=config,
-                            tokenizer=tokenizer,
-                            role_worker_mapping=role_worker_mapping,
-                            resource_pool_manager=resource_pool_manager,
-                            ray_worker_group_cls=ray_worker_group_cls,
-                            reward_fn=reward_fn,
-                            val_reward_fn=val_reward_fn)
-    trainer.init_workers()
-    trainer.fit()
+    # 实例化 RayPPOTrainer，这是 PPO 算法的训练器
+    trainer = RayPPOTrainer(config=config, # 传入配置对象
+                            tokenizer=tokenizer, # 传入分词器
+                            role_worker_mapping=role_worker_mapping, # 传入角色到 worker 的映射
+                            resource_pool_manager=resource_pool_manager, # 传入资源池管理器
+                            ray_worker_group_cls=ray_worker_group_cls, # 传入 Ray worker 组的类
+                            reward_fn=reward_fn, # 传入训练奖励函数
+                            val_reward_fn=val_reward_fn) # 传入验证奖励函数
+    breakpoint() # 设置另一个断点，方便调试
+    trainer.init_workers() # 初始化所有 worker
+    trainer.fit() # 开始训练过程
 
 
 if __name__ == '__main__':

@@ -68,7 +68,7 @@ Assistant: Let me solve this step by step.
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--local_dir', default='~/data/countdown')
+    parser.add_argument('--local_dir', default='data/countdown')
     parser.add_argument('--hdfs_dir', default=None)
     parser.add_argument('--num_samples', type=int, default=100000)
     parser.add_argument('--num_operands', type=int, default=6)
@@ -77,7 +77,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_number', type=int, default=100)
     parser.add_argument('--train_size', type=int, default=327680)
     parser.add_argument('--test_size', type=int, default=1024)
-    parser.add_argument('--template_type', type=str, default='base')
+    parser.add_argument('--template_type', type=str, default='qwen-instruct')
 
     args = parser.parse_args()
 
@@ -85,7 +85,7 @@ if __name__ == '__main__':
     TRAIN_SIZE = args.train_size
     TEST_SIZE = args.test_size
 
-    raw_dataset = load_dataset('Jiayi-Pan/Countdown-Tasks-3to4', split='train')
+    raw_dataset = load_dataset('/data/zhouminghao/TinyZero/datasets/', split='train')
 
     assert len(raw_dataset) > TRAIN_SIZE + TEST_SIZE
     train_dataset = raw_dataset.select(range(TRAIN_SIZE))
