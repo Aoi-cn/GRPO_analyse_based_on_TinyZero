@@ -354,47 +354,92 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
+        # 将输入数据（包含批次数据和元信息）整体移动到 CUDA 设备。
+        # 这通常意味着 DataProto 内部的 TensorDict 中的张量会被移到 GPU。
         data = data.to('cuda')
         breakpoint()
-        assert self._is_actor
-        if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
-        if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
+        # breakpoint() # 调试断点，通常在开发和调试时使用。
 
+        # 断言检查，确保当前 worker 实例确实扮演 Actor 的角色。
+        # self._is_actor 是在 __init__ 中根据传入的 role 设置的布尔标志。
+        assert self._is_actor
+
+        # 如果配置了参数卸载 (offload_param)，则在更新前将 FSDP 包装的 Actor 模型的参数和梯度加载回 GPU。
+        # self._is_offload_param 和 self._is_offload_grad 是根据配置设置的标志。
+        if self._is_offload_param:
+            load_fsdp_param_and_grad(module=self.actor_module_fsdp, # FSDP 包装的 Actor 模型
+                                     device_id=torch.cuda.current_device(), # 当前 CUDA 设备 ID
+                                     load_grad=self._is_offload_grad) # 是否也加载梯度
+
+        # 如果配置了优化器状态卸载 (offload_optimizer)，则在更新前将优化器状态加载回 GPU。
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, # Actor 的优化器
+                                device_id=torch.cuda.current_device()) # 当前 CUDA 设备 ID
+
+        # 再次确保批次数据在 CUDA 设备上。
+        # 尽管 data.to('cuda') 已经执行，这可以视为一个双重检查或针对特定情况的处理。
         data.batch = data.batch.cuda()
 
+        # 记录更新策略前的 GPU 显存使用情况，用于调试和性能分析。
         log_gpu_memory_usage('Before update policy', logger=logger)
 
+        # 使用 Ulysses Sharding Manager 的上下文管理器。
+        # 这个管理器负责处理序列并行 (Sequence Parallelism) 相关的数据切分和收集。
         with self.ulysses_sharding_manager:
+            # 对输入数据进行预处理，以适应序列并行的需求。
+            # 例如，如果启用了序列并行，数据可能会在序列维度上被切分并分发到不同的 GPU。
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
-            # perform training
+
+            # 执行实际的训练步骤（策略更新）
+            # 使用 Timer 来记录 update_policy 方法的执行时间。
             with Timer(name='update_policy', logger=None) as timer:
+                # 调用 self.actor (通常是 DataParallelPPOActor 实例) 的 update_policy 方法。
+                # 这个方法会执行 PPO 算法的核心更新逻辑，包括计算损失、反向传播和参数更新。
+                # data 对象包含了训练所需的所有信息，如 input_ids, attention_mask, old_log_probs, advantages, returns 等。
                 metrics = self.actor.update_policy(data=data)
+            # 获取 update_policy 的执行时间
             delta_time = timer.last
+            # 从元信息中获取全局处理的 token 数量
             global_num_tokens = data.meta_info['global_token_num']
+            # 使用 FlopsCounter 估算本次更新的 FLOPs (浮点运算次数) 和 MFU (模型浮点运算利用率)。
+            # promised_flops 是模型的理论峰值 FLOPs。
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            # 计算 MFU (Model FLOPs Utilization) 并存入 metrics 字典。
+            # ppo_epochs 是 PPO 算法在一个批次数据上迭代的次数。
+            # world_size 是分布式训练中的总进程数 (GPU 数量)。
             metrics['mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
 
+            # 更新学习率调度器 (Learning Rate Scheduler)
             self.actor_lr_scheduler.step()
+            # 获取当前的学习率
             lr = self.actor_lr_scheduler.get_last_lr()[0]
+            # 将当前学习率存入 metrics 字典
             metrics['actor/lr'] = lr
 
+            # 记录更新策略后的 GPU 显存使用情况。
             log_gpu_memory_usage('After update policy', logger=logger)
 
             # TODO: here, we should return all metrics
+            # 创建一个新的 DataProto 对象，用于存储返回的 metrics。
+            # 注意：此时的 output 只包含 meta_info，不包含批次数据 (batch=None 默认)。
             output = DataProto(meta_info={'metrics': metrics})
 
+            # 对输出数据 (仅含 metrics) 进行后处理，以适应序列并行的需求。
+            # 如果有序列并行，可能需要从不同设备收集或同步 metrics。
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
+            # 将最终的输出数据 (metrics) 移动到 CPU。
             output = output.to('cpu')
 
+        # 如果配置了参数卸载，则在更新后将 FSDP 包装的 Actor 模型的参数和梯度卸载回 CPU (或指定的存储)。
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+        # 如果配置了优化器状态卸载，则在更新后将优化器状态卸载回 CPU。
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+
+        # 清空 PyTorch 的 CUDA 缓存，尝试释放未被引用的 GPU 显存。
         torch.cuda.empty_cache()
+        # 返回包含训练指标 (metrics) 的 DataProto 对象。
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)

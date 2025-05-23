@@ -735,6 +735,7 @@ class RayPPOTrainer(object):
                         # gamma: 折扣因子
                         # lam: GAE 的 lambda 参数
                         # num_repeat: rollout 的重复次数
+                        breakpoint()
                         batch = compute_advantage(batch,
                                                   adv_estimator=self.config.algorithm.adv_estimator,
                                                   gamma=self.config.algorithm.gamma,

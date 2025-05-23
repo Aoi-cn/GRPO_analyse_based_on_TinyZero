@@ -283,86 +283,131 @@ class DataParallelPPOActor(BasePPOActor):
         return log_probs
 
     def update_policy(self, data: DataProto):
-        # make sure we are in training mode
+        # 确保 Actor 模型处于训练模式 (例如，启用 Dropout 等)。
         self.actor_module.train()
-
+        breakpoint()
+        # 断言检查：PPO 的小批次大小 (ppo_mini_batch_size) 必须能被微批次大小 (ppo_micro_batch_size) 整除。
+        # 这是梯度累积正确工作的前提。
         assert self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size == 0
+        # 计算梯度累积的步数。在一个小批次 (mini-batch) 中，梯度会累积 gradient_accumulation 个微批次 (micro-batch) 后再进行一次参数更新。
         self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size
-        temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
+        # 从输入数据的元信息中获取温度参数。温度参数用于缩放 logits，影响概率分布的平滑度。
+        # 注释强调了温度参数必须在 meta_info 中，以避免静默错误。
+        temperature = data.meta_info['temperature']
 
+        # 定义需要从 DataProto 对象中选择的数据字段，用于 Actor 策略更新。
         select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
+        # 如果配置了使用 KL 散度损失 (use_kl_loss)，则额外选择 'ref_log_prob' (参考策略的对数概率)。
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
+        # 从 DataProto 对象中提取这些选定的字段，形成一个批次数据 (TensorDict)。
         batch = data.select(batch_keys=select_keys).batch
 
-        # Split to make minibatch iterator for updating the actor
-        # See PPO paper for details. https://arxiv.org/abs/1707.06347
+        # 将整个批次数据 (batch) 按照 PPO 的小批次大小 (ppo_mini_batch_size) 切分成多个小批次。
+        # 这种做法遵循 PPO 论文中的细节，即在多个 epoch 中迭代这些小批次数据进行更新。
+        # dataloader 是一个可迭代对象，每次迭代返回一个小批次 (mini-batch) 数据。
         dataloader = batch.split(self.config.ppo_mini_batch_size)
 
-        metrics = {}
+        metrics = {} # 初始化一个字典来存储训练过程中的各种指标。
+        # 遍历每个小批次 (mini-batch) 数据。
         for batch_idx, data in enumerate(dataloader):
-            # split batch into micro_batches
+            # 当前的 data 就是一个小批次 (mini-batch) 数据。
             mini_batch = data
+            # 如果配置了使用动态批次大小 (use_dynamic_bsz)。
             if self.config.use_dynamic_bsz:
+                # 计算每个 GPU 在考虑序列并行后的最大 token 长度。
                 max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                # 使用 rearrange_micro_batches 将当前小批次 (mini_batch) 动态地重新排列成微批次 (micro-batches)，
+                # 以便每个微批次的总 token 数大致均衡。忽略返回的索引，因为这里不需要恢复顺序。
                 micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
             else:
-                # split batch into micro_batches
+                # 如果不使用动态批次大小，则按固定的微批次大小 (ppo_micro_batch_size) 将小批次 (mini_batch) 切分成微批次。
                 micro_batches = mini_batch.split(self.config.ppo_micro_batch_size)
 
+            # 在处理每个小批次 (mini-batch) 之前，清零 Actor 优化器的梯度。
+            # 这是因为梯度是按小批次累积的（如果 gradient_accumulation > 1），或者在每个小批次后更新。
             self.actor_optimizer.zero_grad()
 
+            # 遍历当前小批次中的每个微批次 (micro-batch) 数据。
             for data in micro_batches:
-                data = data.cuda()  # actor device is cpu when using offload
+                # 将微批次数据移动到 CUDA 设备。
+                # 注释提到，当使用卸载 (offload) 时，Actor 的设备可能是 CPU，所以这里确保数据在 GPU 上进行计算。
+                data = data.cuda()
+                # 从微批次数据中提取响应序列、其长度、注意力掩码、旧的对数概率和优势值。
                 responses = data['responses']
                 response_length = responses.size(1)
                 attention_mask = data['attention_mask']
+                # 提取响应部分的注意力掩码，用于在计算损失时只考虑有效 token。
                 response_mask = attention_mask[:, -response_length:]
-                old_log_prob = data['old_log_probs']
-                advantages = data['advantages']
+                old_log_prob = data['old_log_probs'] # 由旧策略（行为策略）计算的对数概率
+                advantages = data['advantages'] # 估计的优势函数值
 
+                # 从配置中获取 PPO 裁剪比率和熵损失系数。
                 clip_ratio = self.config.clip_ratio
                 entropy_coeff = self.config.entropy_coeff
 
-                # all return: (bsz, response_length)
+                # 调用 _forward_micro_batch 方法，使用当前 Actor 模型对微批次数据进行前向传播，
+                # 获取当前策略下的熵 (entropy) 和对数概率 (log_prob)。
+                # 返回的 entropy 和 log_prob 的形状都是 (bsz, response_length)。
                 entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
 
+                # 使用 core_algos.compute_policy_loss 计算 PPO 的策略梯度损失 (pg_loss)。
+                # 同时返回裁剪部分的比例 (pg_clipfrac) 和新旧策略间的 KL 散度近似值 (ppo_kl)。
                 pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
                                                                               log_prob=log_prob,
                                                                               advantages=advantages,
-                                                                              eos_mask=response_mask,
+                                                                              eos_mask=response_mask, # 使用响应掩码确保只在有效 token 上计算损失
                                                                               cliprange=clip_ratio)
-                # compute entropy loss from entropy
+                # 从前向传播得到的熵计算熵损失。
+                # verl_F.masked_mean 会根据 response_mask 计算掩码后的平均熵。
                 entropy_loss = verl_F.masked_mean(entropy, response_mask)
 
-                # compute policy loss
+                # 计算最终的策略损失，PPO 损失项减去熵损失项 (熵正则化，鼓励探索)。
                 policy_loss = pg_loss - entropy_loss * entropy_coeff
 
+                # 如果配置了使用 KL 散度损失。
                 if self.config.use_kl_loss:
+                    # 获取参考策略的对数概率。
                     ref_log_prob = data['ref_log_prob']
-                    # compute kl loss
+                    # 计算当前策略与参考策略之间的 KL 散度惩罚。
                     kld = core_algos.kl_penalty(logprob=log_prob,
                                                 ref_logprob=ref_log_prob,
-                                                kl_penalty=self.config.kl_loss_type)
+                                                kl_penalty=self.config.kl_loss_type) # KL 惩罚的类型
+                    # 计算掩码后的平均 KL 散度损失。
                     kl_loss = masked_mean(kld, response_mask)
 
+                    # 将 KL 散度损失项添加到总的策略损失中。
                     policy_loss = policy_loss - kl_loss * self.config.kl_loss_coef
+                    # 记录 KL 散度损失和系数到 metrics 中。
                     metrics['actor/kl_loss'] = kl_loss.detach().item()
                     metrics['actor/kl_coef'] = self.config.kl_loss_coef
 
+                # 将计算得到的策略损失除以梯度累积步数。
+                # 这是梯度累积的标准做法，确保在多次累积后，等效的损失与直接使用大批次计算的损失一致。
                 loss = policy_loss / self.gradient_accumulation
+                # 对该微批次的损失进行反向传播，计算梯度。梯度会累积在模型参数上。
                 loss.backward()
 
+                # 准备当前微批次的指标数据。
+                # .detach().item() 用于获取标量值，并从计算图中分离，避免不必要的梯度跟踪。
                 data = {
                     'actor/entropy_loss': entropy_loss.detach().item(),
                     'actor/pg_loss': pg_loss.detach().item(),
                     'actor/pg_clipfrac': pg_clipfrac.detach().item(),
                     'actor/ppo_kl': ppo_kl.detach().item(),
                 }
+                # 将当前微批次的指标追加到总的 metrics 字典中 (通常是累加或取平均)。
                 append_to_dict(metrics, data)
 
+            # 在处理完一个小批次 (mini-batch) 内的所有微批次后，执行优化器步骤。
+            # _optimizer_step 内部会进行梯度裁剪并调用 self.actor_optimizer.step() 来更新模型参数。
             grad_norm = self._optimizer_step()
+            # 准备梯度范数的指标数据。
             data = {'actor/grad_norm': grad_norm.detach().item()}
+            # 将梯度范数指标追加到总的 metrics 字典中。
             append_to_dict(metrics, data)
+        # 在所有小批次处理完毕后（即一个 PPO epoch 完成后），再次清零优化器的梯度。
+        # 这是一个良好的习惯，确保下一个 PPO epoch 开始时梯度是干净的。
         self.actor_optimizer.zero_grad()
+        # 返回包含本次策略更新所有相关指标的字典。
         return metrics

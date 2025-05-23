@@ -1,10 +1,30 @@
+# 全网第二细致的Verl GRPO实现拆解讲解
+> 标题党致歉，纯引流
+> 观前提示，内含大量注释代码，善用左侧目录跳过可改善阅读体验
+
+本篇文章是在锝人的报告下继续撰写，主要着重于verl实现中一些GRPO的具体细节，如这个mask长什么样，这里是怎么算的，这些都是啥。
 
 
-### 整体task框架
-比较抽象的是，不管啥算法在Verl中全部都用这个函数，然后这个文件还叫`main_ppo.py`，不清楚为啥
+## 1. 整体训练框架
+Verl的入口在`main_ppo.py`中的`main_task`函数，比较抽象的是，不管啥算法在Verl中全部都用这个函数，然后这个文件还叫`main_ppo.py`，不清楚为啥。
 
-**main_task 函数完成的事情**：
-这个 `main_task` 函数可以大致分为以下几个部分：
+
+### 1.0 main_task大致框架
+1. **杂七杂八的环境初始化**：
+    * 如各种config，准备模型、分词器什么的
+    * 初始化资源池，包括硬件如何调用
+
+2. **初始化worker**：
+    * 实例化 `RayPPOTrainer`，传入所有必要的配置、对象（如分词器、worker 映射、资源管理器、奖励函数等）。
+    * 调用`trainer.init_workers()`初始化各种worker group，作为后续调用的根据
+    * 如Actor worker group，Critic worker group，后续以group为单位调用各个角色模型
+
+3.  **PPO 训练器 (Trainer) 实例化与执行**:
+    * 调用 `trainer.fit()` 开始 PPO 训练流程。
+    * 后续所有训练都在fit里进行，出来代表整个流程全部结束
+
+
+### 1.1 杂七杂八的环境初始化（可跳过）
 
 1.  **环境初始化与配置加载**:
     *   导入必要的库和模块。
@@ -34,15 +54,11 @@
     *   实例化 `RewardManager` 作为训练用的 `reward_fn`。
     *   实例化 `RewardManager` 作为验证用的 `val_reward_fn` (通常会打印更多信息)。
 
-7.  **资源池管理器实例化**:
+7. **资源池管理器实例化**:
     *   使用之前定义的 `resource_pool_spec` 和 `mapping` 实例化 `ResourcePoolManager`。
 
-8.  **PPO 训练器 (Trainer) 实例化与执行**:
-    *   实例化 `RayPPOTrainer`，传入所有必要的配置、对象（如分词器、worker 映射、资源管理器、奖励函数等）。
-    *   设置断点。
-    *   调用 `trainer.init_workers()` 初始化所有 worker。
-    *   调用 `trainer.fit()` 开始 PPO 训练流程。
 
+下面给出具体代码及注释：
 
 ```python
 def main_task(config):
@@ -172,8 +188,9 @@ def main_task(config):
     trainer.fit() # 开始训练过程
 ```
 
-其中**init_workers**会设置好每个worker接下来所需的一些设置
-它会：
+### 1.2 初始化worker
+
+**init_workers**函数会设置好每个worker接下来所需的一些设置
 
 1. 创建资源池
     * 这个资源池我也不太熟悉，主要似乎是一些关于计算资源（CPU，GPU）的规格和调用方式
@@ -205,8 +222,9 @@ def main_task(config):
 3. 初始化WorkGroup
 4. 将WorkGroup分配给各个角色模型，初始化模型
 
+### 1.3 PPO 训练器 (Trainer) 实例化与执行
 
-主要训练逻辑在末尾的fit()中
+这一步就执行fit，进入正式训练了
 
 **fit 函数详细介绍**
 
@@ -216,6 +234,8 @@ fit函数的主要流程如下：
 
 2. 开始正式训练循环
     0. 预设数据：
+        * 以下这些数据会在后续说明时用到  
+
         ```python
         actor_rollout_ref.rollout.n=5 
         total_epochs = 15
@@ -224,9 +244,10 @@ fit函数的主要流程如下：
         ppo_micro_batch_size=8
         data.max_response_length=1024
         ```
+        
     1. 循环条件：
-        * 循环epochs，每个epochs循环使用`train_dataloader`
-        * `train_dataloader`设置好了size是`train_batch_size`，因此每个batch_dict里包含`train_batch_size`个对象。
+        * 外层循环：遍历总的训练轮数epochs
+        * 内层循环：每个epochs循环使用`train_dataloader` load数据，这个loader设置好了size是`train_batch_size`，因此每个batch_dict里包含`train_batch_size`个对象。
 
         ```python
         # 外层循环：遍历总的训练轮数 (epochs)
@@ -237,9 +258,9 @@ fit函数的主要流程如下：
         ```
 
     2. 循环内容：
-        1. 调用`generate_sequences`函数，传入一个变量，包含
-        `train_batch_size`个prompt，用于当前循环。
-            * `generate_sequences`: 函数init的时候，会查找config里的变量`n`
+        1. 调用`generate_sequences`函数，传入一个变量`gen_batch`，包含
+        `train_batch_size`个prompt，生成出的当前循环所需的所有response。
+            * `generate_sequences`: 函数init的时候，会查找config里的变量`n`作为GRPO rollout的次数。
             ```
             kwargs = dict(
                 n=1,
@@ -248,7 +269,7 @@ fit函数的主要流程如下：
             )
             ```
 
-            于是对于输入的每个prompt，会生成n个response，即总共5 * 32个1024长度的response。
+            这里对于输入的每个prompt，会生成n个response，即总共5 * 32个1024长度的response。
             
             ```
             -> len(prompts)
@@ -257,22 +278,23 @@ fit函数的主要流程如下：
             torch.Size([160, 1024])
             ```
             
-            最后计算old_log_probs，加入output中一并返回。这里的old_log_probs指的是当前response生成时，具体每个token的对数概率；它是通过`forward_micro_batch`函数得到的。
+            最后计算log_probs，以`old_log_probs`的名字加入output中一并返回。这里的`old_log_probs`指的是当前response生成时，具体选中的每个token的对数概率；它是通过`forward_micro_batch`函数得到的（如果不了解可看后文2.1详解）。
         
         2. 检查是否使用Ref策略
+            * Ref是一个参考模型，通常使用相同的模型初始化
             * GRPO需要使用，于是forward获得`ref_log_prob`，用于后续计算KL散度
 
         3. 检查是否使用Critic网络
-            * 不使用，跳过
+            * GRPO不使用Critic，跳过
 
         4. 计算优势 (Advantage) 和奖励 (Reward)
             1. 如果使用奖励模型：
-                * 使用compute_rm_score计算分数，添加到reward tensor
+                * 使用compute_rm_score计算分数，让入reward tensor
                 * 合并reward_tensor至batch中
-            2. 使用奖励规则算分，获取reward_tensor，合并至batch中。
-            ```py
-            batch.batch['token_level_scores'] = reward_tensor
-            ```
+            2. 如果使用奖励规则算分：
+                * 使用reward_fn计算分数，放入reward_tensor
+                * 合并reward_tensor至batch中。
+            
             3. 检查是否使用KL散度
                 * GRPO使用
 
@@ -291,7 +313,13 @@ fit函数的主要流程如下：
             * 我们没使用critic网络，跳过
 
         6. 更新Actor网络（如果Critic预热完毕）
+            * 使用前面获得的优势来计算目标函数，并计算梯度，更新Actor的参数
 
+        7. 计算目前策略的分数
+        
+        8. 如果是检查点，保存模型
+
+下面给出详细注释的完整代码：  
 ```python
     def fit(self):
         """
@@ -501,7 +529,9 @@ fit函数的主要流程如下：
                     return
 ```
 
-**关于计算log_prob**
+## 2. 具体概念、行为详解
+
+### 2.1 关于计算log_prob  
 这里涉及到几个概念，分别是
 1. Logits：
     * 模型对每个词的原始、未归一化的预测分数。对于一个response，他的logits.shape应是[seq_len, vocab_len]。每一个logit包含了这个位置对应vocab中每个词的预测分数。
@@ -520,8 +550,8 @@ fit函数的主要流程如下：
     * 对于这个位置，最后选到的token的对数概率
 
 
-**关于计算奖励**
-
+### 2.2 关于计算奖励
+> 使用compute_rm_score **或** reward_fn
 这里的reward_tensor是一个token level的张量
 
 ```
@@ -533,6 +563,7 @@ torch.Size([160, 1024])
 
 使用奖励模型的计算过程如下（这里GRPO没有使用，仅作学习）：
 **compute_rm_score**
+
 1. 检查是否用了动态批次，如果用了，按照序列并行大小计算最大token长途
 2. 切分batch
     * 这里输入的batch是最大的train_batch_size（32）
@@ -544,6 +575,7 @@ torch.Size([160, 1024])
         * forward计算得分
     
 3. 如果使用动态批次大小，将打乱的得分恢复到原始顺序
+
 
 具体注释版本如下
 ```py
@@ -647,7 +679,7 @@ torch.Size([160, 1024])
 ```
 
 如果不使用奖励模型，则使用对应的**reward_fn**进行打分，**二者互斥**；
-这里**reward_fn**是一个函数指针，根据具体的数据集获取对应的奖励函数，比如我这里使用的是CountDown任务，给出一组数（通常3-4个），给出一个target值，要求模型通过加减乘除这一组数来获得target值。这个任务的奖励函数就是答对了给1分，答错了0分。
+这里**reward_fn**是一个函数指针，根据具体的数据集获取对应的奖励函数。比如我这里使用的是CountDown任务，给出一组数（通常3-4个），给出一个target值，要求模型通过加减乘除这一组数来获得target值。这个任务的奖励函数就是答对了给1分，答错了0分。
 
 **reward_fn**：
 这里给出伪代码  
@@ -668,5 +700,729 @@ return reward_tensor
 
 但其实仔细想想也可以明白，计算的 score 通常是对整个生成的 sequences_str (prompt + response) 的一个整体评估。例如，在 GSM8K（数学问题解答）任务中，score 可能是 1（如果答案正确）或 0（如果答案错误）。这个分数是针对整个解决方案的，而不是针对解决方案中的某一个词或数字。
 
+### 2.3 关于计算优势
 
-update_actor
+优势是奖励的具现化，由奖励计算而来
+
+**compute_advantage**
+`compute_advantage()`函数是优势计算的入口，这个函数的输入是`DataProto: Data`，函数内部会提取出元数据，并根据`adv_estimator`选择专门的优势计算器。这里我们的`adv_estimator == 'grpo'`，因此调用`compute_grpo_outcome_advantage`函数，传入`reward，eos_mask，index`
+
+源代码
+```py
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
+    # prepare response group
+    # TODO: add other ways to estimate advantages
+    if adv_estimator == 'gae':
+        values = data.batch['values']
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        attention_mask = data.batch['attention_mask']
+        response_mask = attention_mask[:, -response_length:]
+        token_level_rewards = data.batch['token_level_rewards']
+        advantages, returns = core_algos.compute_gae_advantage_return(token_level_rewards=token_level_rewards,
+                                                                      values=values,
+                                                                      eos_mask=response_mask,
+                                                                      gamma=gamma,
+                                                                      lam=lam)
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
+    elif adv_estimator == 'grpo':
+        token_level_rewards = data.batch['token_level_rewards']
+        index = data.non_tensor_batch['uid']
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        attention_mask = data.batch['attention_mask']
+        response_mask = attention_mask[:, -response_length:]
+        advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards=token_level_rewards,
+                                                                        eos_mask=response_mask,
+                                                                        index=index)
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
+    else:
+        raise NotImplementedError
+    return data
+```
+
+**compute_grpo_outcome_advantage**
+
+输入参数如下：
+
+```py
+-> token_level_rewards.shape    # token_level_rewards[i][j] 代表第i个response的第j个token的奖励
+torch.Size([160, 1024])
+-> eos_mask.shape               # 无用的padding位置是0，有内容的是1
+torch.Size([160, 1024])
+-> index.shape                  # 每个response对应的字符串id
+(160,)
+-> epsilon
+1e-6
+-> index
+['86fdf296-c41b-4667-a7d8-6fe154b804a2', '86fdf296-c41b-4667-a7d8-6fe154b804a2', '86fdf296-c41b-4667-a7d8-6fe154b804a2', '86fdf296-c41b-4667-a7d8-6fe154b804a2', '86fdf296-c41b-4667-a7d8-6fe154b804a2', 'acfad52a-efca-420f-a436-8a6cc2ac36d1', 'acfad52a-efca-420f-a436-8a6cc2ac36d1', 'acfad52a-efca-420f-a436-8a6cc2ac36d1', 'acfad52a-efca-420f-a436-8a6cc2ac36d1', 'acfad52a-efca-420f-a436-8a6cc2ac36d1', '7a564203-02e2-4086-abe3-71549b0446e5', '7a564203-02e2-4086-abe3-71549b0446e5', '7a564203-02e2-4086-abe3-71549b0446e5', '7a564203-02e2-4086-abe3-71549b0446e5', '7a564203-02e2-4086-abe3-71549b0446e5', '4ce88d65-cd57-4fd0-90b0-c7fd4c18677c', '4ce88d65-cd57-4fd0-90b0-c7fd4c18677c', '4ce88d65-cd57-4fd0-90b0-c7fd4c18677c', '4ce88d65-cd57-4fd0-90b0-c7fd4c18677c', '4ce88d65-cd57-4fd0-90b0-c7fd4c18677c', '0cb174ec-df24-4073-a46a-1b74ddfeb36e', '0cb174ec-df24-4073-a46a-1b74ddfeb36e', '0cb174ec-df24-4073-a46a-1b74ddfeb36e', '0cb174ec-df24-4073-a46a-1b74ddfeb36e', '0cb174ec-df24-4073-a46a-1b74ddfeb36e', ...]
+"""
+    Compute advantage for GRPO, operating only on Outcome reward 
+    (with only one scalar reward for each response).
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length)
+        eos_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+    
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape: (bs, response_length)
+"""
+```
+
+在GRPO中，对于一条response只会给予最后一个token奖励，但这里的分数计算是把这条response里所有token的奖励相加。这是一个健全的写法。
+
+*eos_mask*
+这里的eos_mask和response mask是一个东西，它来自上面的`compute_advantage`函数：
+    `response_mask = attention_mask[:, -response_length:]`
+
+```py
+-> attention_mask.shape
+torch.Size([160, 1280])
+-> response_mask.shape
+torch.Size([160, 1024])
+-> response_length
+1024
+
+attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
+                [(prompt_pad)(prompt_tokens) | (response_tokens)(response_pad)]
+```
+
+attention_mask包括了两部分，propmt的和response的，上面是它的大致结构。其中prompt部分是左padding，response部分是右padding。
+因此attention_mask的长度是`max_prompt_length + max_response_length = 256 + 1024 = 1280`
+`response_mask = attention_mask[:, -response_length:]`
+因此这句代码实际上是切出了attention的所有response的部分，即  
+```py
+[1,1,1,0,0,0,0,0]
+[(response_tokens)(response_pad)]
+```
+
+*index*
+这里的index指的是具体每条对话的id，具体样例可以参考上面；
+排布是把来源于一个prompt的所有rollout放在一起，我这里`rollout.n`设置的是5，因此可以看到一个id会重复5次。
+
+这个index这里主要用于后续计算同一个rollout的内容（均值、标准差）
+
+*具体优势计算*
+```py
+# 对当前样本的得分进行归一化：(score - mean) / (std + epsilon)。
+# 使用对应提示索引的均值和标准差。
+# > len(id2mean)
+# 32
+# > len(id2std)
+# 32
+# > scores.shape
+# [160]
+for i in range(bsz):    # bsz = 160
+    scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+
+scores = scores.unsqueeze(-1).tile([1, response_length]) * eos_mask
+# scores.shape
+# [160, 1024]
+# 对于每一个response[i]，把scores[i]复制response_length次作为这条response最后的token_level_advantage
+# [1.44] ->
+# [1.44, 1.44, 1.44, ... , 1.44] (response_length个)
+```
+
+下面给出详细注释代码
+```py
+def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
+                                   eos_mask: torch.Tensor,
+                                   index: torch.Tensor,
+                                   epsilon: float = 1e-6):
+    """
+    Compute advantage for GRPO, operating only on Outcome reward 
+    (with only one scalar reward for each response).
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length)
+            # 包含了每个 token 可能的奖励。在 outcome supervision 的情况下，
+            # 通常只有一个非零值，位于响应序列的末尾，代表整个序列的标量奖励。
+        eos_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+            # 结束符 (End-Of-Sequence) 掩码。值为 1 的位置表示有效的响应 token，
+            # 通常在实际的 EOS token 处为 1，之后为 0。
+            # GRPO 论文中提到，优势被放置在 EOS token 的位置。
+        index: `(torch.Tensor)`
+            shape: (bs,)
+            # 每个样本的提示 (prompt) 索引。用于对具有相同提示的响应进行分组，
+            # 以便在同一提示下对它们的得分进行归一化。
+        epsilon: `(float)`
+            # 一个小的常数，用于防止在归一化时除以零（如果标准差为零）。
+    
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+            # 计算得到的优势值。在 outcome supervision 的情况下，这通常是归一化后的标量奖励，
+            # 扩展到响应序列的长度，并由 eos_mask 掩码。
+        Returns: `(torch.Tensor)`
+            shape: (bs, response_length)
+            # 在这个特定的 GRPO outcome 实现中，返回值 (Returns) 与优势值 (advantages) 相同。
+            # 这是因为 GRPO 的 outcome 奖励直接作为优势，没有使用值函数进行基线扣除或 GAE 计算。
+    """
+    # 获取响应序列的长度。
+    response_length = token_level_rewards.shape[-1]
+    # 创建一个掩码，标记 token_level_rewards 中非零元素的位置。
+    # 在 outcome supervision 中，这通常会标记出包含标量奖励的那个 token。
+    non_zero_mask = (token_level_rewards != 0)
+    # 将 token_level_rewards 与 non_zero_mask 相乘，确保只考虑非零奖励，
+    # 然后在最后一个维度（序列长度维度）上求和，提取出每个响应的标量得分。
+    # scores 的形状是 (bs,)。
+    scores = (token_level_rewards * non_zero_mask).sum(dim=-1)
+
+    # 初始化一个字典，用于按提示索引 (index) 对得分 (scores) 进行分组。
+    #键是提示索引，值是对应提示下所有响应得分的列表。
+    id2score = defaultdict(list)
+    # 初始化字典，用于存储每个提示索引对应的得分均值。
+    id2mean = {}
+    # 初始化字典，用于存储每个提示索引对应的得分标准差。
+    id2std = {}
+
+    # 在不计算梯度的上下文中执行以下操作，因为这些是数据处理步骤。
+    with torch.no_grad():
+        # 获取批次大小。
+        bsz = scores.shape[0]
+        # 遍历批次中的每个样本。
+        for i in range(bsz):
+            # 将当前样本的得分 scores[i] 添加到其对应提示索引 index[i] 的列表中。
+            id2score[index[i]].append(scores[i])
+        
+        # 遍历 id2score 字典中所有的唯一提示索引。
+        for idx in id2score:
+            # 如果某个提示索引下只有一个响应得分。
+            if len(id2score[idx]) == 1:
+                # 将该提示的均值设为 0.0。
+                # 将该提示的标准差设为 1.0。
+                # 这样做是为了避免当只有一个样本时无法计算标准差，并提供一个默认的归一化行为。
+                id2mean[idx] = torch.tensor(0.0)
+                id2std[idx] = torch.tensor(1.0)
+            # 如果某个提示索引下有多个响应得分。
+            elif len(id2score[idx]) > 1:
+                # 计算这些得分的均值。
+                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
+                # 计算这些得分的标准差。
+                id2std[idx] = torch.std(torch.tensor(id2score[idx])) 
+            # 如果某个提示索引下没有得分（理论上不应发生，因为前面已经添加了）。
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+        
+        # 再次遍历批次中的每个样本，以对其得分进行归一化。
+        for i in range(bsz):
+            # 获取当前样本的提示索引。
+            prompt_idx = index[i]
+            # 对当前样本的得分进行归一化：(score - mean) / (std + epsilon)。
+            # 使用对应提示索引的均值和标准差。
+            scores[i] = (scores[i] - id2mean[prompt_idx]) / (id2std[prompt_idx] + epsilon)
+        
+        # 将归一化后的标量得分 scores (形状 (bs,)) 扩展到响应序列的长度。
+        # 1. unsqueeze(-1) 将 scores 变为 (bs, 1)。
+        # 2. tile([1, response_length]) 将其复制 response_length 次，变为 (bs, response_length)。
+        # 3. 乘以 eos_mask，确保只有在 eos_mask 为 1 的位置（通常是 EOS token 及其之前）才有非零值。
+        #    这意味着归一化的奖励被放置在 EOS token 的位置。
+        scores = scores.unsqueeze(-1).tile([1, response_length]) * eos_mask
+
+    # 返回处理后的 scores 作为优势 (advantages) 和回报 (Returns)。
+    # 在这种 outcome-only 的 GRPO 设置中，归一化的 outcome 奖励直接用作优势和回报。
+    return scores, scores
+```
+
+### 2.4 关于更新策略
+> update_actor -> update_policy -> compute_policy_loss
+
+#### update_actor 
+
+这一步主要是使用刚刚获得的优势来更新Actor的策略（基于前面的token，下一个token的logits生成）
+这一步主要是数据在硬件之间的转移和切换事项（CPU和GPU之间），中间使用封装好的**update_policy**函数来更新模型的参数。
+下面给出伪代码：
+```py
+1. 处理一些硬件上的优化，如开启了参数卸载、优化器状态卸载，这一步就需要把参数重新加载回GPU
+进入GPU操作：
+    2. 如果有序列并行设置，对数据做切分
+    3. 执行actor.update_policy（更新模型参数）这个方法会执行 PPO 算法的核心更新逻辑，包括计算损失、反向传播和参数更新。data 对象包含了训练所需的所有信息，如 input_ids, attention_mask, old_log_probs, advantages, returns 等
+    4. 更新学习率
+    5. 更新训练结果日志
+    6. 输出meta数据到cpu
+7. 如果配置了参数卸载、优化器状态卸载，就把状态重新卸载到CPU
+8. 清空缓存
+```
+
+下面给出完整注释版本代码
+
+```py
+@register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def update_actor(self, data: DataProto):
+        # 将输入数据（包含批次数据和元信息）整体移动到 CUDA 设备。
+        # 这通常意味着 DataProto 内部的 TensorDict 中的张量会被移到 GPU。
+        data = data.to('cuda')
+        # breakpoint() # 调试断点，通常在开发和调试时使用。
+
+        # 断言检查，确保当前 worker 实例确实扮演 Actor 的角色。
+        # self._is_actor 是在 __init__ 中根据传入的 role 设置的布尔标志。
+        assert self._is_actor
+
+        # 如果配置了参数卸载 (offload_param)，则在更新前将 FSDP 包装的 Actor 模型的参数和梯度加载回 GPU。
+        # self._is_offload_param 和 self._is_offload_grad 是根据配置设置的标志。
+        if self._is_offload_param:
+            load_fsdp_param_and_grad(module=self.actor_module_fsdp, # FSDP 包装的 Actor 模型
+                                     device_id=torch.cuda.current_device(), # 当前 CUDA 设备 ID
+                                     load_grad=self._is_offload_grad) # 是否也加载梯度
+
+        # 如果配置了优化器状态卸载 (offload_optimizer)，则在更新前将优化器状态加载回 GPU。
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, # Actor 的优化器
+                                device_id=torch.cuda.current_device()) # 当前 CUDA 设备 ID
+
+        # 再次确保批次数据在 CUDA 设备上。
+        # 尽管 data.to('cuda') 已经执行，这可以视为一个双重检查或针对特定情况的处理。
+        data.batch = data.batch.cuda()
+
+        # 记录更新策略前的 GPU 显存使用情况，用于调试和性能分析。
+        log_gpu_memory_usage('Before update policy', logger=logger)
+
+        # 使用 Ulysses Sharding Manager 的上下文管理器。
+        # 这个管理器负责处理序列并行 (Sequence Parallelism) 相关的数据切分和收集。
+        with self.ulysses_sharding_manager:
+            # 对输入数据进行预处理，以适应序列并行的需求。
+            # 例如，如果启用了序列并行，数据可能会在序列维度上被切分并分发到不同的 GPU。
+            data = self.ulysses_sharding_manager.preprocess_data(data=data)
+
+            # 执行实际的训练步骤（策略更新）
+            # 使用 Timer 来记录 update_policy 方法的执行时间。
+            with Timer(name='update_policy', logger=None) as timer:
+                # 调用 self.actor (通常是 DataParallelPPOActor 实例) 的 update_policy 方法。
+                # 这个方法会执行 PPO 算法的核心更新逻辑，包括计算损失、反向传播和参数更新。
+                # data 对象包含了训练所需的所有信息，如 input_ids, attention_mask, old_log_probs, advantages, returns 等。
+                metrics = self.actor.update_policy(data=data)
+            # 获取 update_policy 的执行时间
+            delta_time = timer.last
+            # 从元信息中获取全局处理的 token 数量
+            global_num_tokens = data.meta_info['global_token_num']
+            # 使用 FlopsCounter 估算本次更新的 FLOPs (浮点运算次数) 和 MFU (模型浮点运算利用率)。
+            # promised_flops 是模型的理论峰值 FLOPs。
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            # 计算 MFU (Model FLOPs Utilization) 并存入 metrics 字典。
+            # ppo_epochs 是 PPO 算法在一个批次数据上迭代的次数。
+            # world_size 是分布式训练中的总进程数 (GPU 数量)。
+            metrics['mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+
+            # 更新学习率调度器 (Learning Rate Scheduler)
+            self.actor_lr_scheduler.step()
+            # 获取当前的学习率
+            lr = self.actor_lr_scheduler.get_last_lr()[0]
+            # 将当前学习率存入 metrics 字典
+            metrics['actor/lr'] = lr
+
+            # 记录更新策略后的 GPU 显存使用情况。
+            log_gpu_memory_usage('After update policy', logger=logger)
+
+            # TODO: here, we should return all metrics
+            # 创建一个新的 DataProto 对象，用于存储返回的 metrics。
+            # 注意：此时的 output 只包含 meta_info，不包含批次数据 (batch=None 默认)。
+            output = DataProto(meta_info={'metrics': metrics})
+
+            # 对输出数据 (仅含 metrics) 进行后处理，以适应序列并行的需求。
+            # 如果有序列并行，可能需要从不同设备收集或同步 metrics。
+            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+            # 将最终的输出数据 (metrics) 移动到 CPU。
+            output = output.to('cpu')
+
+        # 如果配置了参数卸载，则在更新后将 FSDP 包装的 Actor 模型的参数和梯度卸载回 CPU (或指定的存储)。
+        if self._is_offload_param:
+            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+        # 如果配置了优化器状态卸载，则在更新后将优化器状态卸载回 CPU。
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+
+        # 清空 PyTorch 的 CUDA 缓存，尝试释放未被引用的 GPU 显存。
+        torch.cuda.empty_cache()
+        # 返回包含训练指标 (metrics) 的 DataProto 对象。
+        return output
+```
+
+
+#### update_policy
+
+这个函数的输入是一个`DataProto`变量 `data`，`data`中包含了所有更新策略需要的参数，`input_ids, attention_mask, old_log_probs, advantages, returns`
+
+流程：
+1. 对于总的batch（32）：
+    1. 根据是否使用动态批次大小（use_dynamic_bsz）来切分
+        如果使用：
+            根据max_token切
+        不使用：
+            根据mini_batch_size(16)切分
+
+        对于microbatch in minibatch：
+            1. 前向传播，获取熵（Entropy）和每个token的对数概率（log_prob）
+                ```py
+                entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)`
+                # > data.shape
+                # torch.Size([40])
+                # > entropy.shape
+                # torch.Size([40, 1024])
+                # > log_prob.shape
+                # torch.Size([40, 1024])
+                ```
+            2. 计算策略梯度损失  
+                `compute_policy_loss(old_log_prob=old_log_prob,
+                                    log_prob=log_prob,
+                                    advantages=advantages,
+                                    eos_mask=response_mask, # 使用响应掩码确保只在有效 token 上计算损失
+                                    cliprange=clip_ratio)`
+            3. 计算熵损失
+                `entropy_loss = verl_F.masked_mean(entropy, response_mask)`
+            4. 计算最终的策略损失
+                * PPO 损失项减去熵损失项 (熵正则化，鼓励探索)
+                `policy_loss = pg_loss - entropy_loss * entropy_coeff`
+                * 这是一个单独的值，指的是这个microbatch的平均的policy_loss
+            5. 反向传播梯度
+        
+
+给出详细注释版本
+```py
+    def update_policy(self, data: DataProto):
+        # 确保 Actor 模型处于训练模式 (例如，启用 Dropout 等)。
+        self.actor_module.train()
+
+        # 断言检查：PPO 的小批次大小 (ppo_mini_batch_size) 必须能被微批次大小 (ppo_micro_batch_size) 整除。
+        # 这是梯度累积正确工作的前提。
+        assert self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size == 0
+        # 计算梯度累积的步数。在一个小批次 (mini-batch) 中，梯度会累积 gradient_accumulation 个微批次 (micro-batch) 后再进行一次参数更新。
+        self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size
+        # 从输入数据的元信息中获取温度参数。温度参数用于缩放 logits，影响概率分布的平滑度。
+        # 注释强调了温度参数必须在 meta_info 中，以避免静默错误。
+        temperature = data.meta_info['temperature']
+
+        # 定义需要从 DataProto 对象中选择的数据字段，用于 Actor 策略更新。
+        select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
+        # 如果配置了使用 KL 散度损失 (use_kl_loss)，则额外选择 'ref_log_prob' (参考策略的对数概率)。
+        if self.config.use_kl_loss:
+            select_keys.append('ref_log_prob')
+        # 从 DataProto 对象中提取这些选定的字段，形成一个批次数据 (TensorDict)。
+        batch = data.select(batch_keys=select_keys).batch
+
+        # 将整个批次数据 (batch) 按照 PPO 的小批次大小 (ppo_mini_batch_size) 切分成多个小批次。
+        # 这种做法遵循 PPO 论文中的细节，即在多个 epoch 中迭代这些小批次数据进行更新。
+        # dataloader 是一个可迭代对象，每次迭代返回一个小批次 (mini-batch) 数据。
+        dataloader = batch.split(self.config.ppo_mini_batch_size)
+
+        metrics = {} # 初始化一个字典来存储训练过程中的各种指标。
+        # 遍历每个小批次 (mini-batch) 数据。
+        for batch_idx, data in enumerate(dataloader):
+            # 当前的 data 就是一个小批次 (mini-batch) 数据。
+            mini_batch = data
+            # 如果配置了使用动态批次大小 (use_dynamic_bsz)。
+            if self.config.use_dynamic_bsz:
+                # 计算每个 GPU 在考虑序列并行后的最大 token 长度。
+                max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                # 使用 rearrange_micro_batches 将当前小批次 (mini_batch) 动态地重新排列成微批次 (micro-batches)，
+                # 以便每个微批次的总 token 数大致均衡。忽略返回的索引，因为这里不需要恢复顺序。
+                micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+            else:
+                # 如果不使用动态批次大小，则按固定的微批次大小 (ppo_micro_batch_size) 将小批次 (mini_batch) 切分成微批次。
+                micro_batches = mini_batch.split(self.config.ppo_micro_batch_size)
+
+            # 在处理每个小批次 (mini-batch) 之前，清零 Actor 优化器的梯度。
+            # 这是因为梯度是按小批次累积的（如果 gradient_accumulation > 1），或者在每个小批次后更新。
+            self.actor_optimizer.zero_grad()
+
+            # 遍历当前小批次中的每个微批次 (micro-batch) 数据。
+            for data in micro_batches:
+                # 将微批次数据移动到 CUDA 设备。
+                # 注释提到，当使用卸载 (offload) 时，Actor 的设备可能是 CPU，所以这里确保数据在 GPU 上进行计算。
+                data = data.cuda()
+                # 从微批次数据中提取响应序列、其长度、注意力掩码、旧的对数概率和优势值。
+                responses = data['responses']
+                response_length = responses.size(1)
+                attention_mask = data['attention_mask']
+                # 提取响应部分的注意力掩码，用于在计算损失时只考虑有效 token。
+                response_mask = attention_mask[:, -response_length:]
+                old_log_prob = data['old_log_probs'] # 由旧策略（行为策略）计算的对数概率
+                advantages = data['advantages'] # 估计的优势函数值
+
+                # 从配置中获取 PPO 裁剪比率和熵损失系数。
+                clip_ratio = self.config.clip_ratio
+                entropy_coeff = self.config.entropy_coeff
+
+                # 调用 _forward_micro_batch 方法，使用当前 Actor 模型对微批次数据进行前向传播，
+                # 获取当前策略下的熵 (entropy) 和对数概率 (log_prob)。
+                # 返回的 entropy 和 log_prob 的形状都是 (bsz, response_length)。
+                entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+
+                # 使用 core_algos.compute_policy_loss 计算 PPO 的策略梯度损失 (pg_loss)。
+                # 同时返回裁剪部分的比例 (pg_clipfrac) 和新旧策略间的 KL 散度近似值 (ppo_kl)。
+                pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
+                                                                              log_prob=log_prob,
+                                                                              advantages=advantages,
+                                                                              eos_mask=response_mask, # 使用响应掩码确保只在有效 token 上计算损失
+                                                                              cliprange=clip_ratio)
+                # 从前向传播得到的熵计算熵损失。
+                # verl_F.masked_mean 会根据 response_mask 计算掩码后的平均熵。
+                entropy_loss = verl_F.masked_mean(entropy, response_mask)
+
+                # 计算最终的策略损失，PPO 损失项减去熵损失项 (熵正则化，鼓励探索)。
+                policy_loss = pg_loss - entropy_loss * entropy_coeff
+
+                # 如果配置了使用 KL 散度损失。
+                if self.config.use_kl_loss:
+                    # 获取参考策略的对数概率。
+                    ref_log_prob = data['ref_log_prob']
+                    # 计算当前策略与参考策略之间的 KL 散度惩罚。
+                    kld = core_algos.kl_penalty(logprob=log_prob,
+                                                ref_logprob=ref_log_prob,
+                                                kl_penalty=self.config.kl_loss_type) # KL 惩罚的类型
+                    # 计算掩码后的平均 KL 散度损失。
+                    kl_loss = masked_mean(kld, response_mask)
+
+                    # 将 KL 散度损失项添加到总的策略损失中。
+                    policy_loss = policy_loss - kl_loss * self.config.kl_loss_coef
+                    # 记录 KL 散度损失和系数到 metrics 中。
+                    metrics['actor/kl_loss'] = kl_loss.detach().item()
+                    metrics['actor/kl_coef'] = self.config.kl_loss_coef
+
+                # 将计算得到的策略损失除以梯度累积步数。
+                # 这是梯度累积的标准做法，确保在多次累积后，等效的损失与直接使用大批次计算的损失一致。
+                loss = policy_loss / self.gradient_accumulation
+                # 对该微批次的损失进行反向传播，计算梯度。梯度会累积在模型参数上。
+                loss.backward()
+
+                # 准备当前微批次的指标数据。
+                # .detach().item() 用于获取标量值，并从计算图中分离，避免不必要的梯度跟踪。
+                data = {
+                    'actor/entropy_loss': entropy_loss.detach().item(),
+                    'actor/pg_loss': pg_loss.detach().item(),
+                    'actor/pg_clipfrac': pg_clipfrac.detach().item(),
+                    'actor/ppo_kl': ppo_kl.detach().item(),
+                }
+                # 将当前微批次的指标追加到总的 metrics 字典中 (通常是累加或取平均)。
+                append_to_dict(metrics, data)
+
+            # 在处理完一个小批次 (mini-batch) 内的所有微批次后，执行优化器步骤。
+            # _optimizer_step 内部会进行梯度裁剪并调用 self.actor_optimizer.step() 来更新模型参数。
+            grad_norm = self._optimizer_step()
+            # 准备梯度范数的指标数据。
+            data = {'actor/grad_norm': grad_norm.detach().item()}
+            # 将梯度范数指标追加到总的 metrics 字典中。
+            append_to_dict(metrics, data)
+        # 在所有小批次处理完毕后（即一个 PPO epoch 完成后），再次清零优化器的梯度。
+        # 这是一个良好的习惯，确保下一个 PPO epoch 开始时梯度是干净的。
+        self.actor_optimizer.zero_grad()
+        # 返回包含本次策略更新所有相关指标的字典。
+        return metrics
+
+```
+
+
+**compute_policy_loss**
+
+这个函数会返回一个`policy_loss`值，反映了当前策略对比之前策略的好坏，反映了在这个`micro_batch`上遵循了优势信号的平均表现。这个值将用于反向转播更新当前策略的梯度。通常来讲，loss越小越好，我们通常在优化中最小化损失函数。
+
+公式如下：
+
+![alt text](<截屏2025-05-23 13.15.36.png>)
+
+含义：
+```py
+对于rollout中的所有response：
+    对于response中每一个token：
+        1. 计算当前策略和之前策略选取这个token的概率的比值（记作重要性权重`ratio`）
+        2. 计算`ratio * 这个token的优势值`（如果这个动作的优势值大，那么你多选就会收到鼓励--值为正数，少选就会收到惩罚--值为负数）
+        3. 减去KL散度（衡量两个策略的差异）。
+    返回平均值（求和后除以token数量）
+返回平均值（求和后除以response数量）
+```
+
+verl实现：
+```py
+对于一个micro_batch中的所有response：
+    1. 计算`ratio`矩阵
+    2. 计算`ratio矩阵 * -advantages矩阵`
+    3. 计算`clip(ratio矩阵 * -advantages矩阵)`
+    4. 通过`response_mask`计算micro_batch所有的值的平均值?????
+```
+没懂为什么可以在micro_batch的范围上求解
+TODO：
+搞清楚这个
+
+完整详细注释版本代码：
+```py
+def compute_policy_loss(old_log_prob, log_prob, advantages, eos_mask, cliprange):
+    """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1122
+
+    Args:
+        old_log_prob: `(torch.Tensor)`
+            shape: (bs, response_length)
+            # 旧策略（行为策略）下，每个响应 token 的对数概率。
+            # 对应 PPO 公式中的 log(π_θ_old(a_t | s_t))。
+        log_prob: `(torch.Tensor)`
+            shape: (bs, response_length)
+            # 当前策略（新策略）下，每个响应 token 的对数概率。
+            # 对应 PPO 公式中的 log(π_θ(a_t | s_t))。
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+            # 估计的优势函数值。
+            # 对应 PPO 公式中的 A_t。
+        eos_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+            # 结束符掩码，用于确保只在有效的响应 token 上计算损失。
+        cliprange: (float)
+            # PPO 中使用的裁剪范围，通常是一个小值，如 0.2。
+            # 对应 PPO 公式中的 ε。
+
+    Returns:
+        pg_loss: `a scalar torch.Tensor`
+            # 通过 PPO 计算得到的策略梯度损失。
+        pg_clipfrac: (float)
+            # 一个浮点数，表示被裁剪的策略梯度损失的比例。
+        ppo_kl: (float)
+            # 新旧策略之间 KL 散度的近似值。
+
+    PPO Clipped Surrogate Objective:
+    L_CLIP(θ) = E_t [ min(r_t(θ) * A_t, clip(r_t(θ), 1 - ε, 1 + ε) * A_t) ]
+    通常我们最大化这个目标，或者最小化其负值。
+    """
+    # 计算 log(π_θ(a_t | s_t)) - log(π_θ_old(a_t | s_t))
+    # 这等于 log(π_θ(a_t | s_t) / π_θ_old(a_t | s_t)) = log(r_t(θ))
+    # negative_approx_kl 实际上是 log(ratio)，即重要性权重 r_t(θ) 的对数。
+    # KL 散度 D_KL(P || Q) ≈ E_P[log P - log Q]。这里 P 是旧策略，Q 是新策略，所以是 D_KL(π_θ_old || π_θ)。
+    # 因此，-negative_approx_kl = old_log_prob - log_prob 是 D_KL(π_θ || π_θ_old) 的一个近似（或者说，是逐点 KL）。
+    negative_approx_kl = log_prob - old_log_prob
+    
+    # 计算重要性权重 r_t(θ) = π_θ(a_t | s_t) / π_θ_old(a_t | s_t)
+    # ratio = exp(log_prob - old_log_prob)
+    ratio = torch.exp(negative_approx_kl)
+    
+    # 计算新旧策略之间 KL 散度的近似值的掩码后均值。
+    # -negative_approx_kl = old_log_prob - log_prob
+    # ppo_kl 是 E_t[log π_θ_old - log π_θ] 的一个估计，可以看作是 KL(π_θ_old || π_θ) 的近似。
+    # 有些实现也用 (ratio - 1) - log_ratio 作为 KL 散度的一个更精确的估计。
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, eos_mask)
+
+    # 计算 PPO 目标函数的第一项（未裁剪部分）： -A_t * r_t(θ)
+    # 注意这里的负号，因为我们通常是最小化损失，而 PPO 目标是最大化。
+    # 所以，pg_losses 对应于 - (r_t(θ) * A_t)
+    pg_losses = -advantages * ratio
+    
+    # 计算 PPO 目标函数的第二项（裁剪部分）： -A_t * clip(r_t(θ), 1 - ε, 1 + ε)
+    # torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange) 对应于 clip(r_t(θ), 1 - ε, 1 + ε)
+    # pg_losses2 对应于 - (clip(r_t(θ), 1 - ε, 1 + ε) * A_t)
+    pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
+
+    # PPO 目标函数是取未裁剪和裁剪项中较“差”（对于最大化目标而言是较小，对于最小化损失而言是较大）的一项。
+    # torch.max(pg_losses, pg_losses2) 对应于 min(-pg_losses, -pg_losses2) 如果目标是最大化。
+    # 由于 pg_losses 和 pg_losses2 已经是负的目标项，所以 torch.max 实际上是选择了
+    # min(r_t(θ) * A_t, clip(r_t(θ), 1 - ε, 1 + ε) * A_t) 的负值。
+    # pg_loss 是 E_t [ - min(r_t(θ) * A_t, clip(r_t(θ), 1 - ε, 1 + ε) * A_t) ]
+    # 即，pg_loss = - L_CLIP(θ)
+    pg_loss = verl_F.masked_mean(torch.max(pg_losses, pg_losses2), eos_mask)
+    
+    # 计算被裁剪的比例。
+    # torch.gt(pg_losses2, pg_losses) 检查裁剪项是否比未裁剪项“更差”（即更大，因为它们是负值）。
+    # 当 pg_losses2 > pg_losses 时，意味着 -adv * clipped_ratio > -adv * ratio。
+    # 如果 adv > 0: -clipped_ratio > -ratio => clipped_ratio < ratio. 这意味着 ratio 被向下裁剪了。
+    # 如果 adv < 0: -clipped_ratio > -ratio => clipped_ratio > ratio. 这意味着 ratio 被向上裁剪了。
+    # 实际上，当 pg_losses2 > pg_losses 时，意味着未裁剪的项 pg_losses 被选择了（因为 max 操作），
+    # 这表明裁剪发生了作用，使得 pg_losses2 (基于裁剪后的 ratio) 比 pg_losses (基于原始 ratio) 更“有利”于优化器（即损失值更大）。
+    # 更准确地说，当 pg_losses2 > pg_losses 时，意味着原始的 ratio * advantages 项被裁剪了。
+    # 例如，如果 advantages > 0，且 ratio > 1 + cliprange，则 ratio 被裁剪为 1 + cliprange。
+    # 此时 pg_losses = -advantages * ratio (更小的负数，即更大的损失)
+    # pg_losses2 = -advantages * (1 + cliprange) (更大的负数，即更小的损失)
+    # 此时 pg_losses2 < pg_losses，所以 torch.gt(pg_losses2, pg_losses) 为 False。
+    # 当裁剪发生时，意味着 pg_losses (未裁剪) 和 pg_losses2 (裁剪) 中，有一个不是原始的 -advantages * ratio。
+    # pg_clipfrac 计算的是 pg_losses2 > pg_losses 的情况的比例，
+    # 这表示裁剪后的损失项 (-advantages * clipped_ratio) 比原始损失项 (-advantages * ratio) 更大（即更差）。
+    # 这发生在 ratio 被裁剪到离1更近，并且 advantages 的符号使得这个裁剪导致了更大的损失值。
+    # 简单来说，它衡量了有多少比例的样本因为裁剪而选择了 clip(ratio) * advantages 这一项的负值。
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses).float(), eos_mask)
+    
+    # 返回计算得到的策略损失、裁剪比例和 KL 散度近似值。
+    return pg_loss, pg_clipfrac, ppo_kl
+```
+
+
+
+
+### 关于重要性采样
+
+PPO / GRPO的公式都是基于重要性采样的。重要性采样指的是用另一种更简单的分布来估计原有分布的期望。在PPO中，就是使用（新的策略选择当前动作的比率/旧的策略选择当前动作的比率 ）* 当前动作的优势来作为目标函数。
+
+它的目的：
+1.  **修正概率不匹配：**
+    *   PPO 是一种离策略（Off-Policy）算法。这意味着用于训练当前策略 `π_θ`（新策略）的数据（经验）通常是由一个较早版本的策略 `π_θ_old`（行为策略或旧策略）生成的。
+    *   由于 `π_θ` 和 `π_θ_old` 对于相同的状态可能会以不同的概率选择相同的动作，直接使用旧数据来评估新策略的期望回报是不准确的。
+    *   重要性采样通过引入一个**重要性权重（或重要性比率）**来修正这种概率上的差异。这个权重是新策略下采取某个动作的概率与旧策略下采取同一个动作的概率之比：
+        `r_t(θ) = π_θ(a_t | s_t) / π_θ_old(a_t | s_t)`
+    *   这个比率 `r_t(θ)` 告诉我们，相对于旧策略，新策略选择动作 `a_t` 的可能性是增加了还是减少了。
+
+2.  **调整优势函数：**
+    *   在 PPO 的目标函数中，这个重要性比率 `r_t(θ)` 会乘以从旧策略经验中计算出来的优势函数 `A_t`（`advantages`）。
+    *   `r_t(θ) * A_t` 可以被看作是对优势函数的一个调整，使其能够反映在新策略 `π_θ` 下采取动作 `a_t` 的“价值”。
+
+3.  **实现离策略更新：**
+    *   通过这种方式，PPO 可以使用由 `π_θ_old` 收集的经验来估计在 `π_θ` 下的期望回报，从而进行策略改进。这提高了数据利用效率，因为不需要在每次策略微小更新后都重新收集全新的经验。
+
+**重要性采样在哪里工作？**
+
+在 `update_policy` 函数（`dp_actor.py`）中，重要性采样的机制主要体现在以下几个方面，并最终在 `core_algos.compute_policy_loss` 函数中被显式或隐式地使用：
+
+1.  **输入数据包含旧策略的对数概率：**
+    *   `old_log_prob = data['old_log_probs']`
+    *   这个 `old_log_probs` 张量存储的是 `log(π_θ_old(a_t | s_t))`，即行为策略（用于生成当前批次数据的策略）下，每个响应 token 的对数概率。这是计算重要性比率的分母部分（的对数）。
+
+2.  **计算新策略的对数概率：**
+    *   `entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)`
+    *   这个 `log_prob` 张量存储的是 `log(π_θ(a_t | s_t))`，即当前正在优化的 Actor 模型（新策略）下，每个响应 token 的对数概率。这是计算重要性比率的分子部分（的对数）。
+
+3.  **在 `core_algos.compute_policy_loss` 中使用：**
+    *   `pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob, log_prob=log_prob, advantages=advantages, eos_mask=response_mask, cliprange=clip_ratio)`
+    *   这个函数是 PPO 核心算法实现的地方。它接收 `old_log_prob` 和 `log_prob` 作为输入。
+    *   **在 `compute_policy_loss` 内部，会计算重要性比率 `r_t(θ)`**，通常是通过 `exp(log_prob - old_log_prob)` 来计算。
+    *   然后，这个计算出的 `r_t(θ)` 会被用于 PPO 的**裁剪替代目标函数 (Clipped Surrogate Objective)**：
+        `L_CLIP(θ) = E_t [ min(r_t(θ) * A_t, clip(r_t(θ), 1 - ε, 1 + ε) * A_t) ]`
+        其中 `A_t` 是优势函数 (`advantages`)，`ε` 是裁剪参数 (`clip_ratio`)。
+    *   `pg_loss` 就是这个 `L_CLIP(θ)`（或者其负值，因为通常是最小化损失）。
+
+**总结：**
+
+重要性采样在 PPO 中通过以下方式工作：
+
+1.  **获取概率：** 从数据中获取旧策略（行为策略）选择动作的（对数）概率 (`old_log_probs`)。
+2.  **计算新概率：** 使用当前正在训练的策略（目标策略）计算其选择相同动作的（对数）概率 (`log_probs`)。
+3.  **计算重要性比率：** 在损失函数计算的核心部分（`core_algos.compute_policy_loss`），利用这两个概率计算出重要性比率 `r_t(θ) = π_θ / π_θ_old`。
+4.  **应用到目标函数：** 将这个比率乘以优势函数 `A_t`，并应用 PPO 特有的裁剪机制，形成最终的策略梯度损失。
+
+
+
+### 关于长短response样本对结果的影响
+
+这是一个很有意思的问题
+```
+首先解释下，为什么会出现这种现象 —— 因为对于LLM来说，模型生成下一个 token 的概率并不是一成不变的， 而是随着生成句子长度的增加，下一个 token 的概率在整体上是越来越高的，也就是不确定性越来越低。如果统计下整个 repsonse 的log_prob 变化，大概如下面的形状，也就是越往后面 log_prob 是越来越大的（绝对值越来越小）。所以对于长度越长的repsonse，如果直接除以自身的长度值 |oi| ，得到的平均 log_prob 就是越大（绝对值越小），其内部的 token 在总体损失中的贡献就会被相对稀释，再结合advantage正负值，就会出现 “短的正确答案 > 长的正确答案 > 长的错误答案 > 短的错误答案” 的结果。
+
+作者：Kangkang
+链接：https://zhuanlan.zhihu.com/p/1891850600238519595
+来源：知乎
+著作权归作者所有。商业转载请联系作者获得授权，非商业转载请注明出处。
+```
+
+随着句子长度增加，下一个token对数概率（log_prob）在整体上是越来越高（绝对值越来越小）的（呈现log曲线）。没有看懂为什么log_prob会直接影响梯度，我观察公式似乎是以ratio的形式影响loss。
+
+假设修改的幅度越来越低，那么对于长的response，`ratio * 优势 / token数`的值就会低于短的token。
+
+**实验**
+在1000prompt长度未观测到变长变小的现象
+
+log_prob：
+
+![alt text](<截屏2025-05-23 15.50.34.png>)
+
+ratio：
+
+![alt text](<截屏2025-05-23 15.51.39.png>)
+
+TODO：使用更长的上下文实验
